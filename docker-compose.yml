@@ -23,8 +23,8 @@ services:
     command:
       - "-socket=/var/run/sockets/api-1.sock"
       - "-index=/index.bin"
-      - "-nprobe=12"
-      - "-retry-nprobe=24"
+      - "-nprobe=4"
+      - "-retry-nprobe=8"
       - "-debug=:6060"
     environment:
       # asyncpreemptoff was a Mac-native win (no CFS quota) but a disaster
@@ -49,8 +49,8 @@ services:
     command:
       - "-socket=/var/run/sockets/api-2.sock"
       - "-index=/index.bin"
-      - "-nprobe=12"
-      - "-retry-nprobe=24"
+      - "-nprobe=4"
+      - "-retry-nprobe=8"
     environment:
       GOGC: "off"
     # api-2 does not expose debug port (only api-1 is instrumented).

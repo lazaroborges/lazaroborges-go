@@ -18,12 +18,6 @@ import (
 )
 
 func init() {
-	// GOMAXPROCS=1 matches the 0.45 CPU cgroup limit. With =2 the runtime
-	// would race two threads for the same 45ms/100ms CFS quota, exhausting
-	// it in ~22ms wall-clock then suspending the container for the rest of
-	// the period — that 50ms+ stall is what spiked p99 to 483ms on the test
-	// box. =1 keeps CPU burn linear and lets the network poller interleave
-	// HTTP accept with search on the same M.
 	runtime.GOMAXPROCS(1)
 	debug.SetGCPercent(-1)
 	debug.SetMemoryLimit(150 << 20)

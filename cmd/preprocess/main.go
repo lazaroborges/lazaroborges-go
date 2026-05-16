@@ -31,7 +31,7 @@ const dim = 14
 func main() {
 	src := flag.String("src", "/data/references.json.gz", "gzipped references dataset")
 	dst := flag.String("dst", "/index.bin", "output index file")
-	nClusters := flag.Int("clusters", 4096, "k-means cluster count")
+	nClusters := flag.Int("clusters", 1024, "k-means cluster count")
 	iters := flag.Int("iters", 25, "k-means iterations")
 	batch := flag.Int("batch", 200000, "mini-batch sample size per iteration")
 	seed := flag.Int64("seed", 42, "RNG seed")
