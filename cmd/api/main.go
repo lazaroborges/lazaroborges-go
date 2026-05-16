@@ -30,6 +30,8 @@ func init() {
 	runtime.GC()
 }
 
+var contentTypeJSON = []string{"application/json"}
+
 var (
 	idx *index.Index
 
@@ -130,7 +132,7 @@ func decisive(fraudCount int) bool {
 
 func writeBody(w http.ResponseWriter, body []byte) {
 	h := w.Header()
-	h["Content-Type"] = []string{"application/json"}
+	h["Content-Type"] = contentTypeJSON
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }

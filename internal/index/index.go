@@ -17,8 +17,9 @@ type Index struct {
 	NVectors  int
 	NClusters int
 
-	Centroids      []float32 // nClusters × Dim, row-major
-	CentroidNorms  []float32 // length nClusters: ||c||² per centroid (computed once)
+	Centroids       []float32 // nClusters × Dim, row-major (mmap view, kept for invariants)
+	CentroidsPadded []float32 // nClusters × 16, row-major; last 2 lanes per row zeroed for AVX2 loads
+	CentroidNorms   []float32 // length nClusters: ||c||² per centroid (computed once)
 	ClusterOffsets []uint32  // length nClusters+1
 	MemberVecs     []int16   // nVectors × Dim, row-major (reordered)
 	Labels         []uint8   // nVectors
@@ -99,15 +100,26 @@ func Load(path string) (*Index, error) {
 		norms[c] = n
 	}
 
+	// 16-float padded copy of the centroids. The AVX2 dot-product kernel
+	// reads 32 bytes from each side, so the source layout has to provide
+	// 8 valid + 8 zero (or 14 valid + 2 zero) per row. ~256 KB at 4096
+	// clusters — small enough to stay in L2 and avoid TLB pressure on
+	// the centroid pass.
+	centPadded := make([]float32, nClusters*16)
+	for c := 0; c < nClusters; c++ {
+		copy(centPadded[c*16:c*16+Dim], cent[c*Dim:(c+1)*Dim])
+	}
+
 	return &Index{
-		NVectors:       nVectors,
-		NClusters:      nClusters,
-		Centroids:      cent,
-		CentroidNorms:  norms,
-		ClusterOffsets: offsets,
-		MemberVecs:     mem,
-		Labels:         lab,
-		mmapData:       data,
+		NVectors:        nVectors,
+		NClusters:       nClusters,
+		Centroids:       cent,
+		CentroidsPadded: centPadded,
+		CentroidNorms:   norms,
+		ClusterOffsets:  offsets,
+		MemberVecs:      mem,
+		Labels:          lab,
+		mmapData:        data,
 	}, nil
 }
 

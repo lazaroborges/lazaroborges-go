@@ -1,5 +1,7 @@
 package index
 
+import "unsafe"
+
 // Top5 is the fixed-size top-5 maintained without heap allocation. Entries are
 // kept sorted ascending by distance.
 type Top5 struct {
@@ -69,20 +71,21 @@ func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe in
 	//   ||q-c||² = ||q||² + ||c||² - 2·(q·c)
 	// We pre-computed ||c||² at load. ||q||² is identical across centroids so
 	// it doesn't affect ranking — we can drop it entirely (the same constant
-	// added to every distance). What remains: dot product + add - shift. That
-	// halves the FP op count vs the subtract-square version.
-	q0, q1, q2, q3, q4, q5, q6 := qVecFloat[0], qVecFloat[1], qVecFloat[2], qVecFloat[3], qVecFloat[4], qVecFloat[5], qVecFloat[6]
-	q7, q8, q9, q10, q11, q12, q13 := qVecFloat[7], qVecFloat[8], qVecFloat[9], qVecFloat[10], qVecFloat[11], qVecFloat[12], qVecFloat[13]
-	cents := idx.Centroids
+	// added to every distance). What remains: dot product + add - shift.
+	//
+	// The dot product is the hottest scalar float loop on the request path
+	// (~4096 × 14 FLOPs). We hand it off to an AVX2 kernel that reads two
+	// 32-byte chunks per side; both query and centroid layouts pad to 16
+	// floats with the trailing 2 lanes zeroed so the product contributes 0
+	// to the horizontal sum.
+	var qPad [16]float32
+	copy(qPad[:Dim], qVecFloat[:])
+	centsPad := idx.CentroidsPadded
 	norms := idx.CentroidNorms
 	nC := idx.NClusters
 	for c := 0; c < nC; c++ {
-		base := c * Dim
-		_ = cents[base+13] // hoist the bounds check
-		dot := q0*cents[base+0] + q1*cents[base+1] + q2*cents[base+2] + q3*cents[base+3] +
-			q4*cents[base+4] + q5*cents[base+5] + q6*cents[base+6] + q7*cents[base+7] +
-			q8*cents[base+8] + q9*cents[base+9] + q10*cents[base+10] + q11*cents[base+11] +
-			q12*cents[base+12] + q13*cents[base+13]
+		cp := (*[16]float32)(unsafe.Pointer(&centsPad[c*16]))
+		dot := dot14Avx2(&qPad, cp)
 		// rank-equivalent distance: ||c||² - 2·(q·c). ||q||² omitted (constant).
 		cellBuf[c] = CentroidDist{Cluster: uint32(c), Dist: norms[c] - 2*dot}
 	}
