@@ -1,0 +1,5 @@
+/data/references.json.gz
+/data/test-data.json
+*.bin
+/tmp/
+/results.json

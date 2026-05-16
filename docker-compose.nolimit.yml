@@ -1,0 +1,77 @@
+# Rinha de Backend 2026 — Lazaro's submission.
+#
+# Topology (per CLAUDE.md):
+#   HAProxy (TCP mode, :9999) → round-robin → api-1, api-2 over UDS
+#
+# Resource budget (1 CPU + 350MB cap):
+#   haproxy: 0.10 CPU, 25 MB
+#   api-1:   0.45 CPU, 160 MB   (index ~85 MB + Go runtime + pools)
+#   api-2:   0.45 CPU, 160 MB
+#                       --------
+#   total:    1.00 CPU, 345 MB
+#
+# `sockets/` is a shared tmpfs-backed volume so HAProxy can reach the UDS
+# files the API instances create.
+
+services:
+  api-1: &api
+    build:
+      context: ..
+      dockerfile: rinha-2026/Dockerfile
+      target: runtime
+    image: lazaroborges/rinha-2026-api:latest
+    command:
+      - "-socket=/var/run/sockets/api-1.sock"
+      - "-index=/index.bin"
+      - "-nprobe=12"
+      - "-retry-nprobe=96"
+      - "-debug=:6060"
+    environment:
+      GODEBUG: "asyncpreemptoff=1"
+      GOGC: "off"
+    ports:
+      - "16060:6060"
+    volumes:
+      - sockets:/var/run/sockets
+    # NOTE: cpu/memory limits removed for VPS diagnosis. The real
+    # contest-equivalent file is docker-compose.yml.
+    networks: [rinha]
+
+  api-2:
+    <<: *api
+    command:
+      - "-socket=/var/run/sockets/api-2.sock"
+      - "-index=/index.bin"
+      - "-nprobe=12"
+      - "-retry-nprobe=96"
+    environment:
+      GODEBUG: "asyncpreemptoff=1"
+      GOGC: "off"
+    # api-2 does not expose debug port (only api-1 is instrumented).
+    ports: []
+
+  haproxy:
+    build:
+      context: ..
+      dockerfile: rinha-2026/Dockerfile.haproxy
+    image: lazaroborges/rinha-2026-haproxy:latest
+    depends_on:
+      - api-1
+      - api-2
+    ports:
+      - "9999:9999"
+    volumes:
+      - sockets:/var/run/sockets
+    # NOTE: cpu/memory limits removed for VPS diagnosis.
+    networks: [rinha]
+
+networks:
+  rinha:
+    driver: bridge
+
+volumes:
+  sockets:
+    # tmpfs keeps the UDS sockets in RAM (no disk I/O on connect).
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
