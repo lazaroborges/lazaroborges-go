@@ -27,7 +27,7 @@ COPY resources/references.json.gz /data/references.json.gz
 # k-means tuning: 4096 clusters × ~25 iters of mini-batch is a good speed/
 # accuracy point on 3M vectors. Override at build time via --build-arg if
 # accuracy validation says otherwise.
-ARG CLUSTERS=1024
+ARG CLUSTERS=2048
 ARG ITERS=25
 ARG BATCH=200000
 
