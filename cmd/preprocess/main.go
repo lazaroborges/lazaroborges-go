@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lazaroborges/rinha-de-backend-2026/internal/indexwriter"
 )
 
 const dim = 14
@@ -35,6 +37,7 @@ func main() {
 	iters := flag.Int("iters", 25, "k-means iterations")
 	batch := flag.Int("batch", 200000, "mini-batch sample size per iteration")
 	seed := flag.Int64("seed", 42, "RNG seed")
+	format := flag.String("format", "v1", "output format: v1 (legacy IVF) or v2 (IVF-HNSW)")
 	flag.Parse()
 
 	t0 := time.Now()
@@ -71,8 +74,15 @@ func main() {
 	log.Printf("assignment done in %s", time.Since(t0))
 
 	// Group by cluster, write index.
-	log.Printf("writing %s", *dst)
+	log.Printf("writing %s (format=%s)", *dst, *format)
 	t0 = time.Now()
+	if *format == "v2" {
+		if err := indexwriter.WriteV2(*dst, vecs, labels, assignments, centroids, *seed); err != nil {
+			log.Fatalf("v2 write: %v", err)
+		}
+		log.Printf("wrote v2 index to %s in %s", *dst, time.Since(t0))
+		return
+	}
 	if err := writeIndex(*dst, vecs, labels, centroids, assignments, *nClusters); err != nil {
 		log.Fatalf("write: %v", err)
 	}
