@@ -16,7 +16,7 @@ func TestNormalizePayload_LegitExample(t *testing.T) {
       "terminal": {"is_online":false,"card_present":true,"km_from_home":29.2331036248},
       "last_transaction": null
     }`)
-	var v [Dim]float32
+	var v [16]float32
 	if err := NormalizePayload(body, &v); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestNormalizePayload_FraudExample(t *testing.T) {
       "terminal":{"is_online":false,"card_present":true,"km_from_home":952.27},
       "last_transaction":null
     }`)
-	var v [Dim]float32
+	var v [16]float32
 	if err := NormalizePayload(body, &v); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
