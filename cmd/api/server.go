@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/index"
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/response"
@@ -72,8 +71,6 @@ func handleConn(c net.Conn) {
 // pipeline, writes the response frame, and returns true if the connection
 // should be kept alive for the next request.
 func processOne(c net.Conn, b *connBuf) bool {
-	t0 := time.Now()
-
 	headerEnd, err := readUntilHeaderEnd(c, b)
 	if err != nil {
 		// Clean EOF on a keep-alive idle conn is the normal way a connection
@@ -95,8 +92,6 @@ func processOne(c net.Conn, b *connBuf) bool {
 	}
 
 	cl := findContentLength(headers)
-	t1 := time.Now()
-	stReadBody.record(t1.Sub(t0).Nanoseconds())
 
 	if cl < 0 || cl > maxBodySize {
 		_, _ = c.Write(response.FallbackFrame)
@@ -108,14 +103,11 @@ func processOne(c net.Conn, b *connBuf) bool {
 	}
 	body := b.data[bodyStart : bodyStart+cl]
 
-	frame := processSearch(body, t1)
+	frame := processSearch(body)
 
 	if _, err := c.Write(frame); err != nil {
 		return false
 	}
-	t2 := time.Now()
-	stWrite.record(t2.Sub(t1).Nanoseconds())
-	stTotal.record(t2.Sub(t0).Nanoseconds())
 
 	// Consume this request from the buffer; any extra bytes belong to the
 	// next pipelined request and stay around for the next iteration.
@@ -132,7 +124,7 @@ func processOne(c net.Conn, b *connBuf) bool {
 // processSearch runs the existing IVF pipeline on `body` and returns one of
 // the pre-built response frames. Errors short-circuit to FallbackFrame so we
 // never emit a 5xx (per scoring shape, 5xx is weighted 5× in detection error).
-func processSearch(body []byte, t0 time.Time) []byte {
+func processSearch(body []byte) []byte {
 	qFloat := qFloatPool.Get().(*[vector.Dim]float32)
 	defer qFloatPool.Put(qFloat)
 	if err := vector.NormalizePayload(body, qFloat); err != nil {
@@ -141,8 +133,6 @@ func processSearch(body []byte, t0 time.Time) []byte {
 	qInt := qInt16Pool.Get().(*[vector.Dim]int16)
 	defer qInt16Pool.Put(qInt)
 	vector.Quantize(qFloat, qInt)
-	t1 := time.Now()
-	stParse.record(t1.Sub(t0).Nanoseconds())
 
 	top := top5Pool.Get().(*index.Top5)
 	defer top5Pool.Put(top)
@@ -152,11 +142,8 @@ func processSearch(body []byte, t0 time.Time) []byte {
 	defer distBufPool.Put(distBuf)
 
 	idx.SearchIVF(qInt, qFloat, baseNprobe, *cellBuf, *distBuf, top)
-	t2 := time.Now()
-	stSearchOne.record(t2.Sub(t1).Nanoseconds())
 	if !decisive(top.FraudCount()) {
 		idx.SearchIVF(qInt, qFloat, retryNprobe, *cellBuf, *distBuf, top)
-		stSearchTwo.record(time.Since(t2).Nanoseconds())
 	}
 
 	return response.Frames[top.FraudCount()]
