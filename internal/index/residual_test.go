@@ -43,3 +43,20 @@ func TestInt8ResidualSquaredDistance_PadIgnored(t *testing.T) {
 		t.Fatalf("padded lanes leaked: got %d want 0", got)
 	}
 }
+
+// Boundary: qRes filled with +255, mRes filled with -128. Per-lane diff is
+// 383, squared 146689, summed over 14 lanes ≈ 2.05e6. Confirms no overflow
+// at the max expected input range produced by int8-residual subtraction.
+func TestInt8ResidualSquaredDistance_MaxRange(t *testing.T) {
+	var qRes [16]int16
+	var mRes [16]int8
+	for i := 0; i < 14; i++ {
+		qRes[i] = 255
+		mRes[i] = -128
+	}
+	got := int8ResidualSquaredDistance(&qRes, &mRes)
+	want := int32(14 * 383 * 383) // 2,053,646
+	if got != want {
+		t.Fatalf("got %d want %d", got, want)
+	}
+}
