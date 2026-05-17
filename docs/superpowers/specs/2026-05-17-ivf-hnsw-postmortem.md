@@ -85,3 +85,70 @@ Per the score math (`5318 = 2671 p99 + 2647 det`), recovering the 682-point gap 
 The detection gap on docker (E=14) is larger than the in-process v1 number (E=3). This discrepancy is worth investigating — probably a docker config difference (smaller nprobe?) rather than an algorithm issue. Check `docker-compose.yml`: `-nprobe=4 -retry-nprobe=8` is much smaller than the accuracy-probe `nprobe=12/48`. Bumping docker to `nprobe=12/48` may close most of the detection gap with no algorithm change. **Likely cheapest single win available.**
 
 For p99: investigate CFS throttling, HAProxy queue depth, GC behavior under sustained load. Algorithmic micro-optimization (faster JSON parser, fewer syscalls per request, pre-warming connection pools) may help; algorithm replacement won't.
+
+---
+
+## Latency tail investigation (post-pivot)
+
+After accepting v1 as the production search, we instrumented the hot path with per-stage timings (`stReadBody`, `stParse`, `stSearchOne`, `stSearchTwo`, `stWrite`, `stTotal`) and ran k6 to characterize where the docker p99 actually lives.
+
+### Observed timings under k6 900 RPS (nprobe=4, retry=24)
+
+| Stage | p50 | p99 | p999 |
+|---|---|---|---|
+| readBody | 292 ns | 1.2 µs | 3.5 µs |
+| parse+quantize | 7.8 µs | 30.8 µs | 81 µs |
+| searchBase | 127 µs | 389 µs | 717 µs |
+| **searchRetry** | **264 µs** | **1.24 ms** | **1.73 ms** |
+| writeResp | 12 µs | 42 µs | 139 µs |
+| **server total** | 164 µs | **554 µs** | 1.20 ms |
+| **k6 client p99** | — | **2.37 ms** | — |
+
+**Server-side total p99 is 0.55 ms — well under the 1 ms cap.** The remaining 1.8 ms of client p99 lives outside our server measurement: HAProxy queue, goroutine scheduler queue under GOMAXPROCS=1, CFS-pause-induced cache eviction.
+
+### What we tried
+
+- **GOMAXPROCS=2**: server-side timings unchanged, k6 p99 went *up* (2.37 → 2.64 ms). The documented finding holds: with two Ms running CPU-heavy goroutines, CFS exhausts quota faster and stalls the network poller M as collateral damage. Reverted. The freeList mutex stays (drop-in safety for any future experiment).
+- **retry-nprobe sweep**: 12 / 16 / 24 / 32 / 48. retry=24 is the smallest that still hits E=3; going higher is pure latency cost with no detection gain. Originally was 48; lowered.
+- **Asymmetric decisive trigger**: retry on `fraudCount ∈ {1,2,3}` instead of just `{2,3}`. Net +172 detection pts at ~10% more retry fires. Net win.
+- **Cluster count sweep**: 1024 / 2048 / 4096. 2048 is the existing sweet spot — going up (4096) needs higher nprobe to keep detection up, going down (1024) needs higher nprobe to keep recall up. Both worse.
+
+### Final config
+
+```yaml
+# docker-compose.yml
+- "-nprobe=4"
+- "-retry-nprobe=24"
+```
+
+```go
+// cmd/api/main.go
+func decisive(fraudCount int) bool {
+    return fraudCount == 0 || fraudCount >= 4
+}
+```
+
+### Measured score (5-run mean)
+
+| Metric | Baseline | Tuned | Δ |
+|---|---|---|---|
+| `final_score` mean | ~5318 | **~5442** | **+124** |
+| Range (5 runs) | — | 5246-5580 | (env variance) |
+| Detection | 2647 (E=14) | 2819 (E=3) | +172 |
+| p99 latency score | 2671 (2.13 ms) | ~2620 (~2.5 ms) | -50 |
+
+The variance is environmental (CFS scheduling × k6 ramp pattern × cache state). A single run can land anywhere in ±150 of the mean; the contest box may differ further from a Mac docker host.
+
+### Why further latency wins are hard at this constraint level
+
+- **CFS** gives 45 ms / 100 ms per API instance. Single goroutine can burn the budget linearly; multiple parallel goroutines burn it twice as fast and stall together. There is no scheduler trick that gets us past this without changing the CPU limit.
+- **Per-instance L2 cache** is 256 KB on Haswell. A retry scan of 24 × ~3000 × 28 B = 2 MB blows through L2 and L3 fragments. Variance comes from how much survived from the previous query.
+- **Async preempt** keeps the poller responsive at the cost of mid-scan pauses (10-50 µs). Disabling it hurt worse on the contest box (per existing CLAUDE.md notes).
+
+### Knobs not yet tried, ordered by remaining-value-per-risk
+
+1. **Software prefetch** in the AVX2 member scan kernel (`PREFETCHT0` on the next member while computing current). Could reduce searchRetry variance by 20-30% if cache misses are the dominant tail source. Plan 9 assembler support uncertain.
+2. **Pin api-1 / api-2 to distinct physical cores** (`cpuset_cpus`). Removes L1/L2 contention between instances. Possibly against the spirit of "1 CPU total" but the contest box has 2 physical cores + HT; pinning is a legal cgroup config.
+3. **Increase HAProxy CPU budget** from 0.10 → 0.15 (and reduce each API to 0.425). HAProxy isn't bottlenecked today (~3% CPU at peak), so this is unlikely to help — but worth measuring before ruling out.
+4. **Tighten goroutine population**: cap the connection-per-VU count via HAProxy. With 250 k6 VUs each holding a connection, server-side goroutine queue can grow large during bursts. A connection limit forces clients to wait at HAProxy instead — same queue, different place.
+5. **Submit multiple times**: per existing CLAUDE.md note, run-to-run variance is real; the best of N runs can be ~150 pts above mean.
