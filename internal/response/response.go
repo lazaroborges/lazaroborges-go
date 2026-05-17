@@ -33,6 +33,9 @@ var Fallback = Bodies[0]
 // serialization, zero state machine. Used by cmd/api's custom HTTP/1.1 server.
 var Frames [6][]byte
 
+// ReadyFrame is a simple 200 OK for the /ready health check.
+var ReadyFrame = []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}")
+
 // FallbackFrame is the canonical fallback response framed as a full HTTP/1.1
 // reply. Soft-fail in the same shape as a normal 200 OK.
 var FallbackFrame []byte

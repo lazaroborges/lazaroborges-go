@@ -83,6 +83,17 @@ func processOne(c net.Conn, b *connBuf) bool {
 	headers := b.data[b.rpos : b.rpos+headerEnd]
 	bodyStart := b.rpos + headerEnd + 4
 
+	// Handle /ready health check.
+	if len(headers) >= 10 && matchLowerASCII(headers[:10], []byte("get /ready")) {
+		if _, err := c.Write(response.ReadyFrame); err != nil {
+			return false
+		}
+		// /ready usually isn't pipelined, but if it is, consume the header.
+		// Health checks don't have bodies.
+		b.rpos = bodyStart
+		return true
+	}
+
 	cl := findContentLength(headers)
 	t1 := time.Now()
 	stReadBody.record(t1.Sub(t0).Nanoseconds())
