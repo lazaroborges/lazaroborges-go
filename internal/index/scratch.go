@@ -12,10 +12,16 @@ type Candidate struct {
 	Label   uint8
 }
 
-// TopK10 holds up to 10 candidates, kept as a max-heap by Dist so we can
-// evict the worst when full. Fixed-size to avoid allocation.
+// MergedTopKCap is the size of the merged candidate pool fed into float32
+// re-rank. Wider = more chances to recover from int8 ranking noise; cost is
+// re-rank arithmetic (still trivial vs the cell scan).
+const MergedTopKCap = 64
+
+// TopK10 holds up to MergedTopKCap candidates as a max-heap by Dist (root =
+// farthest, eviction target when full). Fixed-size to avoid allocation. Named
+// TopK10 for historical reasons; capacity controlled by MergedTopKCap.
 type TopK10 struct {
-	Items [10]Candidate
+	Items [MergedTopKCap]Candidate
 	N     int
 }
 
@@ -23,10 +29,9 @@ func (t *TopK10) Reset() { t.N = 0 }
 
 // Insert respects max-heap invariant on Dist (root = farthest).
 func (t *TopK10) Insert(c Candidate) {
-	if t.N < 10 {
+	if t.N < MergedTopKCap {
 		t.Items[t.N] = c
 		t.N++
-		// Sift up.
 		i := t.N - 1
 		for i > 0 {
 			p := (i - 1) / 2
@@ -90,5 +95,5 @@ type SearchScratch struct {
 	Visited []uint64      // bitmap sized to max cluster
 	Cand    hnsw.MinHeap
 	HnswOut hnsw.MaxHeap
-	PerCell [8]hnsw.MaxHeap // per-cell K=8 results (supports nCells up to 8)
+	PerCell [32]hnsw.MaxHeap // per-cell K=8 results (supports nCells up to 32)
 }

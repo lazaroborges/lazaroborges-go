@@ -5,19 +5,20 @@ import (
 	"testing"
 )
 
-func TestTopK10_KeepsTenSmallest(t *testing.T) {
+func TestTopK10_KeepsKSmallest(t *testing.T) {
+	const total = 200
 	var h TopK10
 	rng := rand.New(rand.NewSource(42))
-	dists := make([]int32, 0, 100)
-	for i := 0; i < 100; i++ {
+	dists := make([]int32, 0, total)
+	for i := 0; i < total; i++ {
 		d := rng.Int31n(10000)
 		dists = append(dists, d)
 		h.Insert(Candidate{Dist: d, Cluster: 0, LocalID: uint16(i), Label: uint8(i & 1)})
 	}
-	if h.N != 10 {
-		t.Fatalf("got N=%d want 10", h.N)
+	if h.N != MergedTopKCap {
+		t.Fatalf("got N=%d want %d", h.N, MergedTopKCap)
 	}
-	// Sort all 100 distances; the heap should contain exactly the 10 smallest.
+	// Sort all distances; the heap should contain exactly the K smallest.
 	var copy []int32
 	copy = append(copy, dists...)
 	for i := 1; i < len(copy); i++ {
@@ -26,7 +27,7 @@ func TestTopK10_KeepsTenSmallest(t *testing.T) {
 		}
 	}
 	want := map[int32]int{}
-	for _, d := range copy[:10] {
+	for _, d := range copy[:MergedTopKCap] {
 		want[d]++
 	}
 	have := map[int32]int{}

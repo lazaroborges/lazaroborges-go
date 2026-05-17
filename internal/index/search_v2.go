@@ -11,7 +11,7 @@ import (
 // HNSW (K=8 each) → merge to top-10 by int8 distance → float32 re-rank →
 // final top-5 written to `out`.
 //
-// nCells must be ≤ len(scratch.PerCell) (currently 8).
+// nCells must be ≤ len(scratch.PerCell) (currently 32).
 // The caller is responsible for providing scratch.CellBuf sized to NClusters
 // and scratch.Visited sized to the cluster's max member count.
 func (idx *Index) SearchIVFHNSW(
@@ -44,13 +44,13 @@ func (idx *Index) SearchIVFHNSW(
 		selectTopK(scratch.CellBuf[:idx.NClusters], nCells)
 	}
 
-	// 3. For each selected cell, run HNSW with K=8.
+	// 3. For each selected cell, scan members + drain top-K into Merged.
+	//    Reuses a single HnswOut MaxHeap across cells — no PerCell array needed.
 	const K = 8
 	for k := 0; k < nCells; k++ {
 		cellIdx := scratch.CellBuf[k].Cluster
-		idx.searchOneCell(cellIdx, qInt8, K, ef, scratch, &scratch.PerCell[k])
-		// Drain PerCell[k] into Merged with cluster tagging.
-		for _, e := range scratch.PerCell[k].Items() {
+		idx.searchOneCell(cellIdx, qInt8, K, ef, scratch, &scratch.HnswOut)
+		for _, e := range scratch.HnswOut.Items() {
 			from := idx.ClusterOffsets[cellIdx]
 			global := from + uint32(e.ID)
 			scratch.Merged.Insert(Candidate{
@@ -69,10 +69,11 @@ func (idx *Index) SearchIVFHNSW(
 func (idx *Index) searchOneCell(
 	cellIdx uint32,
 	qInt8 *[14]int8,
-	K, ef int,
+	K, ef int, // ef unused in IVFADC mode (kept for API compat with HNSW path)
 	scratch *SearchScratch,
 	out *hnsw.MaxHeap,
 ) {
+	_ = ef
 	// Translate query into this cell's residual int16 space.
 	centBase := int(cellIdx) * 16
 	for i := 0; i < 14; i++ {
@@ -81,17 +82,27 @@ func (idx *Index) searchOneCell(
 	scratch.QRes[14] = 0
 	scratch.QRes[15] = 0
 
-	// Build a Graph view + DistFn over the on-disk edge layout.
-	g, mBase := idx.cellGraph(cellIdx)
-	df := func(mid uint16) int32 {
-		row := mBase + int(mid)*16
-		return int8ResidualSquaredDistance(&scratch.QRes,
-			(*[16]int8)(unsafe.Pointer(&idx.MemberResiduals[row])))
-	}
+	// IVFADC pivot: exhaustively scan all members in the cell with int8
+	// residual SIMD. HNSW navigation hit a recall ceiling on this data
+	// (small residual magnitudes → poor graph navigation precision); a
+	// linear scan with the same kernel gives true top-K and pays only a
+	// constant-factor cost over the per-cluster size (~3000 dist evals).
+	from, to := idx.ClusterOffsets[cellIdx], idx.ClusterOffsets[cellIdx+1]
+	count := int(to - from)
+	mBase := int(from) * 16
 
-	scratch.Cand.Reset()
 	out.Reset()
-	g.Search(df, K, ef, scratch.Visited, &scratch.Cand, out)
+	for i := 0; i < count; i++ {
+		row := mBase + i*16
+		d := int8ResidualSquaredDistance(&scratch.QRes,
+			(*[16]int8)(unsafe.Pointer(&idx.MemberResiduals[row])))
+		if out.Len() < K {
+			out.Push(hnsw.Entry{Dist: d, ID: uint16(i)})
+		} else if d < out.Top().Dist {
+			out.Pop()
+			out.Push(hnsw.Entry{Dist: d, ID: uint16(i)})
+		}
+	}
 }
 
 // cellGraph constructs a *hnsw.Graph view backed by the mmap'd edge bytes
@@ -157,7 +168,7 @@ func readUint16Slice(data []byte, off, n int) []uint16 {
 // writes the top-5 by exact float32 squared distance into `out`, sorted
 // ascending by Dist.
 func (idx *Index) rerankTop5(merged *TopK10, qFloat *[16]float32, out *Top5Final) {
-	var dists [10]float32
+	var dists [MergedTopKCap]float32
 	for i := 0; i < merged.N; i++ {
 		c := merged.Items[i]
 		centBase := int(c.Cluster) * Dim
@@ -171,18 +182,23 @@ func (idx *Index) rerankTop5(merged *TopK10, qFloat *[16]float32, out *Top5Final
 		}
 		dists[i] = s
 	}
-	// Select top-5 by ascending dist. Insertion sort over up to 10 entries.
-	indices := [10]int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+	// Select top-5 by ascending float32 dist. Partial insertion sort over the
+	// first 5 positions of a paired index array.
+	var indices [MergedTopKCap]int
+	for i := 0; i < merged.N; i++ {
+		indices[i] = i
+	}
+	limit := 5
+	if merged.N < limit {
+		limit = merged.N
+	}
 	for i := 1; i < merged.N; i++ {
 		for j := i; j > 0 && dists[indices[j]] < dists[indices[j-1]]; j-- {
 			indices[j], indices[j-1] = indices[j-1], indices[j]
 		}
 	}
-	out.N = 5
-	if merged.N < 5 {
-		out.N = merged.N
-	}
-	for i := 0; i < out.N; i++ {
+	out.N = limit
+	for i := 0; i < limit; i++ {
 		out.Dist[i] = dists[indices[i]]
 		out.Label[i] = merged.Items[indices[i]].Label
 	}
