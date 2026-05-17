@@ -72,11 +72,13 @@ func (f *freeList) Put(item any) {
 }
 
 // decisive reports whether the top-5 vote is far enough from the 0.6 decision
-// threshold that re-running is unlikely to flip the verdict. Retry on counts
-// 2 and 3 — these are the boundary cases where extra cells can change the
-// majority. Aligned with cmd/accuracy so behavior matches the gate.
+// threshold that re-running is unlikely to flip the verdict. Asymmetric: FN
+// weighs 3× FP in the scoring rule, so we retry whenever there is any fraud
+// signal at all (count ∈ {1,2,3}). Skip retry only on truly unanimous
+// "approved" (count == 0) and strong "fraud" (count >= 4). Aligned with
+// cmd/accuracy so behavior matches the gate.
 func decisive(fraudCount int) bool {
-	return fraudCount <= 1 || fraudCount >= 4
+	return fraudCount == 0 || fraudCount >= 4
 }
 
 func main() {

@@ -178,9 +178,12 @@ func runV2(idx *index.Index, entries []entry, baseN, retryN, ef, retryEF int, tp
 	}
 }
 
-// decisive returns true when the vote is unambiguous (≤1 or ≥4 fraud neighbors).
+// decisive returns true when the vote is unambiguous.
+// Asymmetric trigger: FN weighs 3× FP, so retry whenever leaning
+// "approve" with any fraud signal at all. Skip retry only on truly
+// unanimous "approved" (count == 0) and strong "fraud" (count >= 4).
 func decisive(fraudCount int) bool {
-	return fraudCount <= 1 || fraudCount >= 4
+	return fraudCount == 0 || fraudCount >= 4
 }
 
 // tally increments the appropriate tp/tn/fp/fn counter.
