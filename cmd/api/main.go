@@ -142,8 +142,8 @@ func main() {
 	sockPath := flag.String("socket", "/var/run/api.sock", "UDS path to listen on (when -listen is empty)")
 	listenAddr := flag.String("listen", "", "if non-empty, bind a TCP socket here instead of UDS (e.g. :9999) — local dev only")
 	indexPath := flag.String("index", "/index.bin", "path to IVF index file")
-	nprobeFlag := flag.Int("nprobe", 12, "base IVF nprobe")
-	retryFlag := flag.Int("retry-nprobe", 48, "IVF nprobe for ambiguous queries")
+	nprobeFlag := flag.Int("nprobe", 4, "base IVF nprobe")
+	retryFlag := flag.Int("retry-nprobe", 8, "IVF nprobe for ambiguous queries")
 	debugAddr := flag.String("debug", "", "if non-empty, expose /debug/timings on this TCP addr (local only)")
 	flag.Parse()
 	if *debugAddr != "" {
