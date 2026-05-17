@@ -71,7 +71,11 @@ func TestRecallSmall(t *testing.T) {
 		}
 	}
 
-	// M=12 gives ≥0.98 recall@5 at ef=32; M=6 only achieves ~0.85 at this ef.
+	// M=12 here, not the production M=6: random 14D vectors test the Build
+	// algorithm but make HNSW navigation hard (no cluster structure); real
+	// clustered IVF residuals pass recall@5≥0.95 at M=6 — validated in
+	// cmd/accuracy (Task 14). M=6 on this dataset only reaches ~0.85 recall
+	// at ef=32, which would be a false signal about Build correctness.
 	g := Build(uint16(N), 12, 200, 0xBEEF, func(a, b uint16) int32 {
 		var s int32
 		ab, bb := int(a)*Dim, int(b)*Dim
