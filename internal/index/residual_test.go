@@ -60,3 +60,56 @@ func TestInt8ResidualSquaredDistance_MaxRange(t *testing.T) {
 		t.Fatalf("got %d want %d", got, want)
 	}
 }
+
+func TestInt8ResidualSquaredDistance_RandomCrossCheck(t *testing.T) {
+	// Brute-force reference for comparison.
+	ref := func(q *[16]int16, m *[16]int8) int32 {
+		var s int64
+		for i := 0; i < 14; i++ {
+			d := int64(q[i]) - int64(m[i])
+			s += d * d
+		}
+		return int32(s)
+	}
+	rng := newDeterministicRNG(0xC0FFEE)
+	for trial := 0; trial < 1000; trial++ {
+		var q [16]int16
+		var m [16]int8
+		for i := 0; i < 14; i++ {
+			// Stay in the documented ±255 range for q, full int8 range for m.
+			q[i] = int16(rng.intn(511) - 255)
+			m[i] = int8(rng.intn(255) - 127)
+		}
+		got := int8ResidualSquaredDistance(&q, &m)
+		want := ref(&q, &m)
+		if got != want {
+			t.Fatalf("trial %d: got %d want %d (q=%v m=%v)", trial, got, want, q, m)
+		}
+	}
+}
+
+// newDeterministicRNG is a tiny xorshift, avoids pulling in math/rand state.
+type detRNG struct{ s uint64 }
+
+func newDeterministicRNG(seed uint64) *detRNG { return &detRNG{s: seed | 1} }
+func (r *detRNG) intn(n int) int {
+	r.s ^= r.s << 13
+	r.s ^= r.s >> 7
+	r.s ^= r.s << 17
+	return int(r.s % uint64(n))
+}
+
+func BenchmarkInt8ResidualSquaredDistance(b *testing.B) {
+	var q [16]int16
+	var m [16]int8
+	for i := 0; i < 14; i++ {
+		q[i] = int16(i*17 - 50)
+		m[i] = int8(i*11 - 70)
+	}
+	b.ResetTimer()
+	var sink int32
+	for i := 0; i < b.N; i++ {
+		sink = int8ResidualSquaredDistance(&q, &m)
+	}
+	_ = sink
+}
