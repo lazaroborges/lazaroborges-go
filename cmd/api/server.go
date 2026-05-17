@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"time"
 
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/index"
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/response"
@@ -69,6 +70,11 @@ func handleConn(c net.Conn) {
 // processOne reads one HTTP/1.1 request from `c` into `b`, runs the search
 // pipeline, writes the response frame, and returns true if the connection
 // should be kept alive for the next request.
+//
+// Records per-stage timings into the debug rings so we can spot where p99
+// tail latency lives. stReadBody covers the network read for body bytes;
+// stTotal covers the in-server portion of one request (does not include
+// HAProxy queue, TCP RTT to/from client, or scheduler wait time).
 func processOne(c net.Conn, b *connBuf) bool {
 	headerEnd, err := readUntilHeaderEnd(c, b)
 	if err != nil {
@@ -76,6 +82,10 @@ func processOne(c net.Conn, b *connBuf) bool {
 		// ends. Don't write a fallback — the peer is gone.
 		return false
 	}
+	// Start timing once we have a complete request header; this excludes
+	// keep-alive idle time between requests.
+	t0 := time.Now()
+
 	headers := b.data[b.rpos : b.rpos+headerEnd]
 	bodyStart := b.rpos + headerEnd + 4
 
@@ -97,16 +107,22 @@ func processOne(c net.Conn, b *connBuf) bool {
 		return false
 	}
 
+	tBeforeBody := time.Now()
 	if err := ensureBody(c, b, bodyStart, cl); err != nil {
 		return false
 	}
+	stReadBody.record(int64(time.Since(tBeforeBody)))
 	body := b.data[bodyStart : bodyStart+cl]
 
 	frame := processSearch(body)
 
+	tWrite := time.Now()
 	if _, err := c.Write(frame); err != nil {
 		return false
 	}
+	stWrite.record(int64(time.Since(tWrite)))
+
+	stTotal.record(int64(time.Since(t0)))
 
 	// Consume this request from the buffer; any extra bytes belong to the
 	// next pipelined request and stay around for the next iteration.
@@ -133,6 +149,7 @@ func processSearch(body []byte) []byte {
 // the pre-built response frames. Errors short-circuit to FallbackFrame so we
 // never emit a 5xx (per scoring shape, 5xx is weighted 5× in detection error).
 func processSearchV1(body []byte) []byte {
+	tParse := time.Now()
 	qFloat := qFloatPool.Get().(*[16]float32)
 	if err := vector.NormalizePayload(body, qFloat); err != nil {
 		qFloatPool.Put(qFloat)
@@ -140,14 +157,19 @@ func processSearchV1(body []byte) []byte {
 	}
 	qInt := qInt16Pool.Get().(*[16]int16)
 	vector.Quantize(qFloat, qInt)
+	stParse.record(int64(time.Since(tParse)))
 
 	top := top5Pool.Get().(*index.Top5)
 	cellBuf := cellBufPool.Get().(*[]index.CentroidDist)
 	distBuf := distBufPool.Get().(*[]int64)
 
+	tBase := time.Now()
 	idx.SearchIVF(qInt, qFloat, baseNprobe, *cellBuf, *distBuf, top)
+	stSearchOne.record(int64(time.Since(tBase)))
 	if !decisive(top.FraudCount()) {
+		tRetry := time.Now()
 		idx.SearchIVF(qInt, qFloat, retryNprobe, *cellBuf, *distBuf, top)
+		stSearchTwo.record(int64(time.Since(tRetry)))
 	}
 
 	frame := response.Frames[top.FraudCount()]

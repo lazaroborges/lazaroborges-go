@@ -9,12 +9,19 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"syscall"
 
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/index"
 )
 
 func init() {
+	// GOMAXPROCS=1: parallel Ms run twice as fast through CPU work, but
+	// CFS throttles them once the 45ms/100ms quota is spent — at which
+	// point the network poller M is *also* throttled, stalling accept
+	// (measured: GOMAXPROCS=2 raised k6 p99 from 2.37ms → 2.64ms despite
+	// identical server-side total p99). Single M lets async preempt keep
+	// the poller alive on the same goroutine.
 	runtime.GOMAXPROCS(1)
 	debug.SetGCPercent(-1)
 	debug.SetMemoryLimit(150 << 20)
@@ -24,8 +31,10 @@ func init() {
 var (
 	idx *index.Index
 
-	// Helicopter optimization: custom single-threaded freeList instead of sync.Pool.
-	// Since GOMAXPROCS=1, we don't need atomic sync or thread-local caches.
+	// Custom mutex-guarded freeList instead of sync.Pool. sync.Pool's per-P
+	// caching + GC-drop semantics add unpredictable behavior; a small mutex
+	// over a bounded slice is ~30-50ns uncontended and predictable. Required
+	// to be thread-safe because GOMAXPROCS>1 enables parallel request handlers.
 	qFloatPool = newFreeList(func() any { return new([16]float32) })
 	qInt16Pool = newFreeList(func() any { return new([16]int16) })
 	top5Pool   = newFreeList(func() any { return new(index.Top5) })
@@ -48,6 +57,7 @@ var (
 )
 
 type freeList struct {
+	mu    sync.Mutex
 	items []any
 	newFn func() any
 }
@@ -57,18 +67,23 @@ func newFreeList(fn func() any) *freeList {
 }
 
 func (f *freeList) Get() any {
+	f.mu.Lock()
 	if len(f.items) == 0 {
+		f.mu.Unlock()
 		return f.newFn()
 	}
 	item := f.items[len(f.items)-1]
 	f.items = f.items[:len(f.items)-1]
+	f.mu.Unlock()
 	return item
 }
 
 func (f *freeList) Put(item any) {
+	f.mu.Lock()
 	if len(f.items) < cap(f.items) {
 		f.items = append(f.items, item)
 	}
+	f.mu.Unlock()
 }
 
 // decisive reports whether the top-5 vote is far enough from the 0.6 decision
