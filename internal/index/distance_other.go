@@ -34,3 +34,11 @@ func int16SqDist14(q *[Dim]int16, m *int16) int32 {
 	}
 	return int32(sum)
 }
+
+func memberScanAvx2(q *[Dim]int16, members *int16, out *int32, n uint64) {
+	for i := uint64(0); i < n; i++ {
+		mp := (*int16)(unsafe.Pointer(uintptr(unsafe.Pointer(members)) + uintptr(i)*Dim*2))
+		op := (*int32)(unsafe.Pointer(uintptr(unsafe.Pointer(out)) + uintptr(i)*4))
+		*op = int16SqDist14(q, mp)
+	}
+}

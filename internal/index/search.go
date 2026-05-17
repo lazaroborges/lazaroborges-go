@@ -1,7 +1,5 @@
 package index
 
-import "unsafe"
-
 // Top5 is the fixed-size top-5 maintained without heap allocation. Entries are
 // kept sorted ascending by distance.
 type Top5 struct {
@@ -64,7 +62,7 @@ func (t *Top5) insert(d int32, lab uint8) {
 // caller is responsible for both. `nprobe` controls how many cells to scan.
 // `cellBuf` is a scratch buffer of length ≥ nClusters used for centroid
 // distance ranking. Results are written into `out`.
-func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe int, cellBuf []CentroidDist, out *Top5) {
+func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe int, cellBuf []CentroidDist, distBuf []int32, out *Top5) {
 	out.Reset()
 
 	// Distance from query to every centroid via the norm trick:
@@ -80,15 +78,7 @@ func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe in
 	// to the horizontal sum.
 	var qPad [16]float32
 	copy(qPad[:Dim], qVecFloat[:])
-	centsPad := idx.CentroidsPadded
-	norms := idx.CentroidNorms
-	nC := idx.NClusters
-	for c := 0; c < nC; c++ {
-		cp := (*[16]float32)(unsafe.Pointer(&centsPad[c*16]))
-		dot := dot14Avx2(&qPad, cp)
-		// rank-equivalent distance: ||c||² - 2·(q·c). ||q||² omitted (constant).
-		cellBuf[c] = CentroidDist{Cluster: uint32(c), Dist: norms[c] - 2*dot}
-	}
+	centroidPassAvx2(&qPad, &idx.CentroidsPadded[0], &idx.CentroidNorms[0], &cellBuf[0], uint64(idx.NClusters))
 	// Partial sort: find the nprobe smallest using selection.
 	selectTopK(cellBuf[:idx.NClusters], nprobe)
 
@@ -102,19 +92,26 @@ func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe in
 		}
 	}
 
-	// Iterate members of those top nprobe cells, computing int16 squared
-	// distance and feeding into the fixed-size top-5 buffer. The distance
-	// kernel is AVX2 assembly on amd64 (see distance_amd64.s); see
-	// distance_other.go for the portable fallback.
+	// Iterate members of those top nprobe cells. For each cell we run the
+	// distance kernel as a single batched assembly call (memberScanAvx2)
+	// that keeps q in YMM registers across all members in the cell, then
+	// feed the resulting int32 distances into the fixed-size top-5 buffer.
+	// Batching this way trades ~12k Go→ASM calls per query for nprobe (≤24)
+	// batched calls — saves the per-call boundary cost.
 	mem := idx.MemberVecs
+	labels := idx.Labels
 	for k := 0; k < nprobe; k++ {
 		c := cellBuf[k].Cluster
 		from := idx.ClusterOffsets[c]
 		to := idx.ClusterOffsets[c+1]
-		for v := from; v < to; v++ {
-			base := int(v) * Dim
-			d := int16SqDist14(qVec, &mem[base])
-			out.insert(d, idx.Labels[v])
+		count := int(to - from)
+		if count == 0 {
+			continue
+		}
+		memberScanAvx2(qVec, &mem[int(from)*Dim], &distBuf[0], uint64(count))
+		labelBase := labels[from:to]
+		for v := 0; v < count; v++ {
+			out.insert(distBuf[v], labelBase[v])
 		}
 	}
 }

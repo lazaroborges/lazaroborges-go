@@ -43,6 +43,7 @@ var (
 		return new(index.Top5)
 	}}
 	cellBufPool *sync.Pool // initialised after we know NClusters
+	distBufPool *sync.Pool // initialised after we know NVectors
 
 	baseNprobe  int
 	retryNprobe int
@@ -99,12 +100,14 @@ func handleFraudScore(w http.ResponseWriter, r *http.Request) {
 	defer top5Pool.Put(top)
 	cellBuf := cellBufPool.Get().(*[]index.CentroidDist)
 	defer cellBufPool.Put(cellBuf)
+	distBuf := distBufPool.Get().(*[]int32)
+	defer distBufPool.Put(distBuf)
 
-	idx.SearchIVF(qInt, qFloat, baseNprobe, *cellBuf, top)
+	idx.SearchIVF(qInt, qFloat, baseNprobe, *cellBuf, *distBuf, top)
 	t3 := time.Now()
 	stSearchOne.record(t3.Sub(t2).Nanoseconds())
 	if !decisive(top.FraudCount()) {
-		idx.SearchIVF(qInt, qFloat, retryNprobe, *cellBuf, top)
+		idx.SearchIVF(qInt, qFloat, retryNprobe, *cellBuf, *distBuf, top)
 		stSearchTwo.record(time.Since(t3).Nanoseconds())
 	}
 	t4 := time.Now()
@@ -171,6 +174,21 @@ func main() {
 		return &buf
 	}}
 
+	// Member-scan output buffer needs to fit the largest cluster. Compute
+	// once at load and size the pool to that.
+	maxCell := 0
+	for c := 0; c < idx.NClusters; c++ {
+		size := int(idx.ClusterOffsets[c+1] - idx.ClusterOffsets[c])
+		if size > maxCell {
+			maxCell = size
+		}
+	}
+	log.Printf("largest cluster: %d members", maxCell)
+	distBufPool = &sync.Pool{New: func() any {
+		buf := make([]int32, maxCell)
+		return &buf
+	}}
+
 	// Pre-warm pools so the first N requests don't pay allocation cost.
 	// Adds maybe 1 MB of resident heap, eliminates fresh-alloc tail spikes.
 	for i := 0; i < 64; i++ {
@@ -181,6 +199,8 @@ func main() {
 		top5Pool.Put(new(index.Top5))
 		cb := make([]index.CentroidDist, idx.NClusters)
 		cellBufPool.Put(&cb)
+		db := make([]int32, maxCell)
+		distBufPool.Put(&db)
 	}
 
 	var ln net.Listener

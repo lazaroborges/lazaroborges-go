@@ -60,6 +60,14 @@ func main() {
 	var qInt [vector.Dim]int16
 	var top index.Top5
 	cellBuf := make([]index.CentroidDist, idx.NClusters)
+	maxCell := 0
+	for c := 0; c < idx.NClusters; c++ {
+		size := int(idx.ClusterOffsets[c+1] - idx.ClusterOffsets[c])
+		if size > maxCell {
+			maxCell = size
+		}
+	}
+	distBuf := make([]int32, maxCell)
 
 	var tp, tn, fp, fn, errs int
 	t0 := time.Now()
@@ -70,10 +78,10 @@ func main() {
 			continue
 		}
 		vector.Quantize(&qFloat, &qInt)
-		idx.SearchIVF(&qInt, &qFloat, *baseN, cellBuf, &top)
+		idx.SearchIVF(&qInt, &qFloat, *baseN, cellBuf, distBuf, &top)
 		count := top.FraudCount()
 		if !decisive(count) {
-			idx.SearchIVF(&qInt, &qFloat, *retryN, cellBuf, &top)
+			idx.SearchIVF(&qInt, &qFloat, *retryN, cellBuf, distBuf, &top)
 			count = top.FraudCount()
 		}
 		approved := count < 3
