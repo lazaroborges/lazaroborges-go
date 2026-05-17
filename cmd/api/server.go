@@ -120,10 +120,19 @@ func processOne(c net.Conn, b *connBuf) bool {
 	return true
 }
 
-// processSearch runs the existing IVF pipeline on `body` and returns one of
+// processSearch dispatches to the v1 (IVF) or v2 (IVF-HNSW) pipeline
+// depending on the -search flag set at startup.
+func processSearch(body []byte) []byte {
+	if useIVFHNSW {
+		return processSearchV2(body)
+	}
+	return processSearchV1(body)
+}
+
+// processSearchV1 runs the existing IVF pipeline on `body` and returns one of
 // the pre-built response frames. Errors short-circuit to FallbackFrame so we
 // never emit a 5xx (per scoring shape, 5xx is weighted 5× in detection error).
-func processSearch(body []byte) []byte {
+func processSearchV1(body []byte) []byte {
 	qFloat := qFloatPool.Get().(*[16]float32)
 	if err := vector.NormalizePayload(body, qFloat); err != nil {
 		qFloatPool.Put(qFloat)
@@ -148,6 +157,35 @@ func processSearch(body []byte) []byte {
 	top5Pool.Put(top)
 	cellBufPool.Put(cellBuf)
 	distBufPool.Put(distBuf)
+
+	return frame
+}
+
+// processSearchV2 runs the IVF-HNSW pipeline on `body` and returns one of
+// the pre-built response frames. Errors short-circuit to FallbackFrame.
+func processSearchV2(body []byte) []byte {
+	qFloat := qFloatPool.Get().(*[16]float32)
+	if err := vector.NormalizePayload(body, qFloat); err != nil {
+		qFloatPool.Put(qFloat)
+		return response.FallbackFrame
+	}
+	qInt8 := qInt8Pool.Get().(*[14]int8)
+	vector.QuantizeInt8(qFloat, qInt8)
+
+	scratch := scratchPool.Get().(*index.SearchScratch)
+	top := top5FinalPool.Get().(*index.Top5Final)
+
+	idx.SearchIVFHNSW(qFloat, qInt8, baseNprobe, baseEf, scratch, top)
+	if !decisive(top.FraudCount()) {
+		idx.SearchIVFHNSW(qFloat, qInt8, retryNprobe, retryEf, scratch, top)
+	}
+
+	frame := response.Frames[top.FraudCount()]
+
+	qFloatPool.Put(qFloat)
+	qInt8Pool.Put(qInt8)
+	scratchPool.Put(scratch)
+	top5FinalPool.Put(top)
 
 	return frame
 }

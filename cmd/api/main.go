@@ -33,8 +33,18 @@ var (
 	cellBufPool *freeList // initialised after we know NClusters
 	distBufPool *freeList // initialised after we know NVectors
 
+	// v2 (IVF-HNSW) pools — nil until -search=ivfhnsw is selected.
+	qInt8Pool     *freeList
+	top5FinalPool *freeList
+	scratchPool   *freeList
+
 	baseNprobe  int
 	retryNprobe int
+
+	// v2 routing
+	useIVFHNSW bool
+	baseEf     int
+	retryEf    int
 )
 
 type freeList struct {
@@ -75,6 +85,9 @@ func main() {
 	indexPath := flag.String("index", "/index.bin", "path to IVF index file")
 	nprobeFlag := flag.Int("nprobe", 4, "base IVF nprobe")
 	retryFlag := flag.Int("retry-nprobe", 8, "IVF nprobe for ambiguous queries")
+	searchMode := flag.String("search", "ivf", `search backend: "ivf" (v1, default) or "ivfhnsw" (v2)`)
+	efFlag := flag.Int("ef", 32, "base HNSW ef (v2 only)")
+	retryEfFlag := flag.Int("retry-ef", 64, "retry HNSW ef (v2 only)")
 	debugAddr := flag.String("debug", "", "if non-empty, expose /debug/timings on this TCP addr (local only)")
 	flag.Parse()
 	if *debugAddr != "" {
@@ -103,6 +116,9 @@ func main() {
 
 	baseNprobe = *nprobeFlag
 	retryNprobe = *retryFlag
+	useIVFHNSW = *searchMode == "ivfhnsw"
+	baseEf = *efFlag
+	retryEf = *retryEfFlag
 
 	loaded, err := index.Load(*indexPath)
 	if err != nil {
@@ -140,6 +156,27 @@ func main() {
 		db := make([]int64, maxCell)
 		distBufPool.Put(&db)
 		connBufPool.Put(&connBuf{data: make([]byte, maxConnBufSize)})
+	}
+
+	if useIVFHNSW {
+		visitedSize := (maxCell + 63) / 64
+		qInt8Pool = newFreeList(func() any { return new([14]int8) })
+		top5FinalPool = newFreeList(func() any { return new(index.Top5Final) })
+		scratchPool = newFreeList(func() any {
+			return &index.SearchScratch{
+				CellBuf: make([]index.CentroidDist, idx.NClusters),
+				Visited: make([]uint64, visitedSize),
+			}
+		})
+		for i := 0; i < 128; i++ {
+			qInt8Pool.Put(new([14]int8))
+			top5FinalPool.Put(new(index.Top5Final))
+			scratchPool.Put(&index.SearchScratch{
+				CellBuf: make([]index.CentroidDist, idx.NClusters),
+				Visited: make([]uint64, visitedSize),
+			})
+		}
+		log.Printf("IVF-HNSW mode: ef=%d retry-ef=%d", baseEf, retryEf)
 	}
 
 	var ln net.Listener
