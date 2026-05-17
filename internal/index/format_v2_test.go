@@ -6,14 +6,13 @@ import (
 	"testing"
 
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/index"
+	"github.com/lazaroborges/rinha-de-backend-2026/internal/indexwriter"
 )
 
-// This test compiles only after both writer (in cmd/preprocess/hnsw_build.go)
-// and reader (in internal/index/index.go) exist. It exercises the round trip
-// on a tiny synthetic dataset.
 func TestFormatV2RoundTrip(t *testing.T) {
 	tmp := t.TempDir()
 	dst := filepath.Join(tmp, "tiny.bin")
+	defer os.Remove(dst)
 
 	const N, K = 200, 4
 	vecs := make([]float32, N*14)
@@ -35,22 +34,45 @@ func TestFormatV2RoundTrip(t *testing.T) {
 		assign[i] = uint32(i % K)
 	}
 
-	// writeIndexV2 lives in package main of cmd/preprocess; for the test,
-	// expose it via a small wrapper there (see Task 8) OR replicate the call
-	// here in a helper. For now this test is a placeholder until Task 8
-	// extracts the writer into a callable from tests.
-	t.Skip("activated in Task 8 after extracting writeIndexV2")
+	if err := indexwriter.WriteV2(dst, vecs, labels, assign, centroids, 42); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := index.Load(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idx.Close()
 
-	_ = dst
-	_ = assign
-	_ = os.Remove
-	_ = vecs
-	_ = labels
-	_ = centroids
-	_ = index.VersionV2
-	// idx, err := index.Load(dst)
-	// require.NoError(t, err)
-	// require.Equal(t, index.VersionV2, idx.Version)
-	// require.Equal(t, N, idx.NVectors)
-	// require.Equal(t, K, idx.NClusters)
+	if idx.Version != index.VersionV2 {
+		t.Fatalf("version mismatch: got %d want %d", idx.Version, index.VersionV2)
+	}
+	if idx.NVectors != N || idx.NClusters != K {
+		t.Fatalf("shape mismatch: got %dv/%dc want %dv/%dc",
+			idx.NVectors, idx.NClusters, N, K)
+	}
+	// Spot-check centroids round-tripped.
+	for c := 0; c < K; c++ {
+		for d := 0; d < 14; d++ {
+			got := idx.Centroids[c*14+d]
+			want := centroids[c*14+d]
+			if got != want {
+				t.Fatalf("centroid[%d][%d]: got %v want %v", c, d, got, want)
+			}
+		}
+	}
+	// Labels are reordered into cluster groups. Spot-check legitimate range.
+	for i := 0; i < N; i++ {
+		if idx.Labels[i] > 1 {
+			t.Fatalf("bad label %d at %d", idx.Labels[i], i)
+		}
+	}
+	// Per-cluster sanity: offsets monotonic and end at N.
+	for c := 0; c < K; c++ {
+		if idx.ClusterOffsets[c] > idx.ClusterOffsets[c+1] {
+			t.Fatalf("offsets non-monotonic at cluster %d", c)
+		}
+	}
+	if int(idx.ClusterOffsets[K]) != N {
+		t.Fatalf("final offset %d != N=%d", idx.ClusterOffsets[K], N)
+	}
 }
