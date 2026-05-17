@@ -2,85 +2,70 @@
 
 #include "textflag.h"
 
-// func memberScanAvx2(q *[16]int16, members *int16, out *int32, n uint64)
+// func memberScanAvx2(q *[16]int16, members *int16, norms *int64, qNorm int64, out *int64, n uint64)
 //
-// Computes the squared Euclidean distance between q (a 14-d int16 vector,
-// passed as a 16-int16 array — the trailing lanes 14, 15 are not read by
-// this kernel) and each of `n` consecutive 14-int16 members at `members`,
-// writing the int32 results to out[].
+// Per-member squared distance via the dot-product identity:
+//   ‖q-m‖² = qNorm + norms[i] − 2·(q·m)
 //
-// Members are tightly packed (stride 14 int16 = 28 bytes), matching the
-// on-disk layout of MemberVecs. Like int16SqDist14, this uses two overlapping
-// 8-lane loads at offsets 0 and 12 to cover the 14 lanes without reading
-// past the member's 28-byte boundary; the doubled contribution from lanes
-// 6, 7 is subtracted as a scalar correction.
+// Why this kernel and not subtract-then-square: VPMADDWD on Haswell has
+// 1-cycle throughput on port 0 and turns 16 int16 lanes into 8 int32
+// partial sums of the form (a₀b₀+a₁b₁, a₂b₂+a₃b₃, …) in one instruction.
+// That replaces the prior widen-subtract-multiply chain entirely. Memory
+// bandwidth is also lower: one 32-byte member load per iteration vs the
+// previous two overlapping 16-byte sign-extended loads.
 //
-// Q is sign-extended to int32 lanes ONCE before the loop and kept in YMM
-// registers across iterations — that's the win over calling int16SqDist14
-// in a Go loop, which would re-load and re-extend q every iteration.
+// Q layout: padded to 16 int16 (last 2 lanes zero). Because q[14]=q[15]=0,
+// the VPMADDWD pair for lanes (14,15) contributes 0 regardless of what's
+// loaded for m[14..15] — so we can do a full 32-byte VMOVDQU per member
+// even though member stride is only 28 bytes. The 4-byte overrun lands in
+// the next member (or in the Labels region for the very last member); the
+// mmap is one contiguous mapping so the read is page-safe.
+//
+// Overflow: each VPMADDWD lane = 2·(int16²) ≤ 2·32767² ≈ 2.147e9 < INT32_MAX
+// by ~130k. Horizontal sum of 8 such lanes can reach ~1.7e10, so we widen to
+// int64 before accumulating. Final distance is int64.
 //
 // Plan 9 VEX op order: (src2, src1, dst) → dst = src1 op src2.
-TEXT ·memberScanAvx2(SB), NOSPLIT, $0-32
-	MOVQ q+0(FP), AX
+TEXT ·memberScanAvx2(SB), NOSPLIT, $0-48
+	MOVQ q+0(FP),       AX
 	MOVQ members+8(FP), BX
-	MOVQ out+16(FP), CX
-	MOVQ n+24(FP), R8
+	MOVQ norms+16(FP),  CX
+	MOVQ qNorm+24(FP),  DX
+	MOVQ out+32(FP),    R8
+	MOVQ n+40(FP),      R9
 
-	// Pre-load q into YMM regs (sign-extended to int32).
-	VPMOVSXWD (AX), Y0          // Y0 = q[0..7]   as 8×int32  (kept)
-	VPMOVSXWD 12(AX), Y10       // Y10 = q[6..13] as 8×int32  (kept; overlaps Y0 at lanes 6,7)
+	VMOVDQU (AX), Y0              // Y0 = q (16 int16, q[14]=q[15]=0)
 
-	MOVQ $0x7fffffff, R12       // saturation constant
-
-	XORQ R9, R9                 // i = 0
+	XORQ R10, R10                 // i = 0
 loop:
-	CMPQ R9, R8
+	CMPQ R10, R9
 	JE   done
 
-	// ---- low half: q[0..7] - m[0..7] ----
-	VPMOVSXWD (BX), Y1          // m[0..7]
-	VPSUBD    Y1, Y0, Y2        // Y2 = q[0..7] - m[0..7]
-	VPSRLQ    $32, Y2, Y3       // odd int32 lanes → low halves
-	VPMULDQ   Y2, Y2, Y4        // (d0², d2², d4², d6²) as 4×int64
-	VPMULDQ   Y3, Y3, Y5        // (d1², d3², d5², d7²) as 4×int64
-	VPADDQ    Y5, Y4, Y4        // 4×int64 pair sums
+	VMOVDQU (BX), Y1              // 32-byte member load (overruns 4B; lanes 14,15 zeroed by q)
+	VPMADDWD Y0, Y1, Y2           // Y2 = 8 int32 partial sums: (q·m)_pair
 
-	// ---- high half: q[6..13] - m[6..13] ----
-	VPMOVSXWD 12(BX), Y6
-	VPSUBD    Y6, Y10, Y7
-	VPSRLQ    $32, Y7, Y8
-	VPMULDQ   Y7, Y7, Y9
-	VPMULDQ   Y8, Y8, Y11
-	VPADDQ    Y11, Y9, Y9
-	VPADDQ    Y9, Y4, Y4        // sum both halves (lanes 6,7 counted twice)
+	// Horizontal sum 8 int32 → 1 int64 via widen-then-add (avoid overflow).
+	VPMOVSXDQ X2, Y3              // low 4 int32 → 4 int64 in Y3
+	VEXTRACTI128 $1, Y2, X4
+	VPMOVSXDQ X4, Y4              // high 4 int32 → 4 int64 in Y4
+	VPADDQ Y4, Y3, Y3             // 4 int64 sums
+	VEXTRACTI128 $1, Y3, X5
+	VPADDQ X5, X3, X3             // 2 int64 sums in X3
+	VPSHUFD $0x4E, X3, X6         // swap qwords of X3 → X6
+	VPADDQ X6, X3, X3             // X3.qword[0] = full dot product
+	VMOVQ X3, R11                 // R11 = dot
 
-	// ---- horizontal sum of 4 int64 in Y4 → scalar in DX ----
-	VEXTRACTI128 $1, Y4, X12
-	VPADDQ       X12, X4, X4
-	VPSHUFD      $0x4E, X4, X13
-	VPADDQ       X13, X4, X4
-	MOVQ         X4, DX
+	// dist = qNorm + norms[i] − 2·dot
+	MOVQ (CX), R12
+	ADDQ DX, R12                  // R12 = qNorm + norms[i]
+	SHLQ $1, R11                  // R11 = 2·dot
+	SUBQ R11, R12                 // R12 = qNorm + norms[i] − 2·dot
+	MOVQ R12, (R8)                // out[i] = dist
 
-	// ---- subtract doubled d[6]² + d[7]² (lanes 0,1 of X7 = q[6..13]-m[6..13]) ----
-	VPEXTRD $0, X7, R14
-	MOVLQSX R14, R14
-	IMULQ   R14, R14
-	VPEXTRD $1, X7, R15
-	MOVLQSX R15, R15
-	IMULQ   R15, R15
-	SUBQ    R14, DX
-	SUBQ    R15, DX
-
-	// ---- saturate at int32 max ----
-	CMPQ DX, R12
-	JLE  no_sat
-	MOVQ R12, DX
-no_sat:
-	MOVL DX, (CX)               // out[i] = (int32) clamped(distance)
-
-	ADDQ $28, BX                // members += 14 int16 = 28 bytes
-	ADDQ $4, CX                 // out += 1 int32 = 4 bytes
-	INCQ R9
+	ADDQ $28, BX                  // members += 14 int16
+	ADDQ $8,  CX                  // norms   += 1 int64
+	ADDQ $8,  R8                  // out     += 1 int64
+	INCQ R10
 	JMP  loop
 done:
 	VZEROUPPER

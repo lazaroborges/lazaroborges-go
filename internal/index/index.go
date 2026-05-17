@@ -22,6 +22,8 @@ type Index struct {
 	CentroidNorms   []float32 // length nClusters: ||c||² per centroid (computed once)
 	ClusterOffsets []uint32  // length nClusters+1
 	MemberVecs     []int16   // nVectors × Dim, row-major (reordered)
+	MemberNorms    []int64   // length nVectors: ||m||² per member (computed once for the dot-product
+	                         // distance trick: ||q-m||² = ||q||² + ||m||² − 2·(q·m))
 	Labels         []uint8   // nVectors
 
 	mmapData []byte
@@ -110,6 +112,21 @@ func Load(path string) (*Index, error) {
 		copy(centPadded[c*16:c*16+Dim], cent[c*Dim:(c+1)*Dim])
 	}
 
+	// Per-member squared norms for the dot-product distance kernel. One-shot
+	// at startup; 3M × 8 bytes = 24 MB heap, well within the container limit.
+	// Reading int16 from the mmap view and accumulating to int64 sidesteps the
+	// overflow concern at large quantization scales.
+	memNorms := make([]int64, nVectors)
+	for i := 0; i < nVectors; i++ {
+		base := i * Dim
+		var s int64
+		for d := 0; d < Dim; d++ {
+			v := int64(mem[base+d])
+			s += v * v
+		}
+		memNorms[i] = s
+	}
+
 	return &Index{
 		NVectors:        nVectors,
 		NClusters:       nClusters,
@@ -118,6 +135,7 @@ func Load(path string) (*Index, error) {
 		CentroidNorms:   norms,
 		ClusterOffsets:  offsets,
 		MemberVecs:      mem,
+		MemberNorms:     memNorms,
 		Labels:          lab,
 		mmapData:        data,
 	}, nil

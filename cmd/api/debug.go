@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"sync/atomic"
@@ -30,14 +31,14 @@ var (
 	stSearchTwo = &stage{name: "searchRetry"}
 	stWrite     = &stage{name: "writeResp"}
 	stTotal     = &stage{name: "total"}
-
-	debugEnabled atomic.Bool
 )
 
 func (s *stage) record(ns int64) {
-	if !debugEnabled.Load() {
-		return
-	}
+	// Recording is always on. Cost is a single atomic increment + a single
+	// array write per stage (~30 ns total per request), well under 0.05% of
+	// budget at 900 RPS. The /debug/timings HTTP endpoint is still gated on
+	// the -debug flag, but the in-process timing dump emitted on SIGTERM
+	// (see dumpTimings in main.go) needs unconditional data.
 	i := s.idx.Add(1) - 1
 	s.samples[int(i)%ringSize] = ns
 }
@@ -86,4 +87,22 @@ func handleDebugReset(w http.ResponseWriter, _ *http.Request) {
 		s.idx.Store(0)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// dumpTimings logs a one-line-per-stage timing summary to stdout. Called from
+// a SIGTERM handler so the contest infrastructure captures it in container
+// logs after the load test finishes — no need for an exposed debug port.
+func dumpTimings() {
+	stages := []*stage{stReadBody, stParse, stSearchOne, stSearchTwo, stWrite, stTotal}
+	log.Printf("timing dump: %-16s %8s %8s %8s %8s %8s", "stage", "n", "p50", "p90", "p99", "p999")
+	for _, s := range stages {
+		ss := s.snapshot()
+		log.Printf("timing dump: %-16s %8d %8s %8s %8s %8s",
+			s.name, len(ss),
+			fmtDur(pct(ss, 0.50)),
+			fmtDur(pct(ss, 0.90)),
+			fmtDur(pct(ss, 0.99)),
+			fmtDur(pct(ss, 0.999)),
+		)
+	}
 }

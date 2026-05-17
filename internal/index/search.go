@@ -2,8 +2,12 @@ package index
 
 // Top5 is the fixed-size top-5 maintained without heap allocation. Entries are
 // kept sorted ascending by distance.
+//
+// Distances are int64 because the dot-product distance form (qNorm + memberNorm
+// − 2·dot) doesn't fit in int32 at full quantization scale, and we want
+// ranking to remain exact (no saturation).
 type Top5 struct {
-	Dist  [5]int32
+	Dist  [5]int64
 	Label [5]uint8
 	N     int // current count, ≤ 5
 }
@@ -26,9 +30,8 @@ func (t *Top5) FraudCount() int {
 
 // insert adds (d, lab) into the sorted top-5 if it qualifies. Branch-light
 // insertion sort over a fixed 5-element array.
-func (t *Top5) insert(d int32, lab uint8) {
+func (t *Top5) insert(d int64, lab uint8) {
 	if t.N < 5 {
-		// Append, then bubble down.
 		t.Dist[t.N] = d
 		t.Label[t.N] = lab
 		t.N++
@@ -41,7 +44,6 @@ func (t *Top5) insert(d int32, lab uint8) {
 	if d >= t.Dist[4] {
 		return
 	}
-	// Find insertion point and shift right.
 	pos := 4
 	for pos > 0 && t.Dist[pos-1] > d {
 		t.Dist[pos] = t.Dist[pos-1]
@@ -55,27 +57,16 @@ func (t *Top5) insert(d int32, lab uint8) {
 // SearchIVF runs the IVF query. `qVec` is the int16-quantized query and
 // `qVecFloat` is the same value as float32 (used for centroid distance). The
 // caller is responsible for both. `nprobe` controls how many cells to scan.
-// Results are written into `out`.
-//
-// SearchIVF runs the IVF query. `qVec` is the int16-quantized query and
-// `qVecFloat` is the same value as float32 (used for centroid distance). The
-// caller is responsible for both. `nprobe` controls how many cells to scan.
 // `cellBuf` is a scratch buffer of length ≥ nClusters used for centroid
-// distance ranking. Results are written into `out`.
-func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe int, cellBuf []CentroidDist, distBuf []int32, out *Top5) {
+// distance ranking. `distBuf` is a scratch buffer of length ≥ maxCellSize
+// used for per-cell member distances. Results are written into `out`.
+func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe int, cellBuf []CentroidDist, distBuf []int64, out *Top5) {
 	out.Reset()
 
 	// Distance from query to every centroid via the norm trick:
 	//   ||q-c||² = ||q||² + ||c||² - 2·(q·c)
 	// We pre-computed ||c||² at load. ||q||² is identical across centroids so
-	// it doesn't affect ranking — we can drop it entirely (the same constant
-	// added to every distance). What remains: dot product + add - shift.
-	//
-	// The dot product is the hottest scalar float loop on the request path
-	// (~4096 × 14 FLOPs). We hand it off to an AVX2 kernel that reads two
-	// 32-byte chunks per side; both query and centroid layouts pad to 16
-	// floats with the trailing 2 lanes zeroed so the product contributes 0
-	// to the horizontal sum.
+	// it doesn't affect ranking — we can drop it entirely.
 	var qPad [16]float32
 	copy(qPad[:Dim], qVecFloat[:])
 	centroidPassAvx2(&qPad, &idx.CentroidsPadded[0], &idx.CentroidNorms[0], &cellBuf[0], uint64(idx.NClusters))
@@ -92,14 +83,23 @@ func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe in
 		}
 	}
 
-	// Iterate members of those top nprobe cells. For each cell we run the
-	// distance kernel as a single batched assembly call (memberScanAvx2)
-	// that keeps q in YMM registers across all members in the cell, then
-	// feed the resulting int32 distances into the fixed-size top-5 buffer.
-	// Batching this way trades ~12k Go→ASM calls per query for nprobe (≤24)
-	// batched calls — saves the per-call boundary cost.
+	// Precompute ||q||² in int64 — constant for this query, used by every
+	// member-distance computation in the kernel.
+	var qNorm int64
+	var qPadI16 [16]int16
+	for i := 0; i < Dim; i++ {
+		v := int64(qVec[i])
+		qNorm += v * v
+		qPadI16[i] = qVec[i]
+	}
+
+	// Iterate members of those top nprobe cells. Per cell we batch the
+	// distance kernel as one VPMADDWD-based asm call that keeps q in YMM
+	// registers across all members in the cell and writes int64 distances to
+	// distBuf; then a tight Go loop feeds them into the fixed-size top-5.
 	mem := idx.MemberVecs
 	labels := idx.Labels
+	norms := idx.MemberNorms
 	for k := 0; k < nprobe; k++ {
 		c := cellBuf[k].Cluster
 		from := idx.ClusterOffsets[c]
@@ -108,7 +108,7 @@ func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe in
 		if count == 0 {
 			continue
 		}
-		memberScanAvx2(qVec, &mem[int(from)*Dim], &distBuf[0], uint64(count))
+		memberScanAvx2(&qPadI16, &mem[int(from)*Dim], &norms[from], qNorm, &distBuf[0], uint64(count))
 		labelBase := labels[from:to]
 		for v := 0; v < count; v++ {
 			out.insert(distBuf[v], labelBase[v])
@@ -167,43 +167,4 @@ func selectTopK(arr []CentroidDist, k int) {
 			return
 		}
 	}
-}
-
-// int32SqDist computes squared Euclidean distance between two int16 14-d
-// vectors. We widen to int32 only for the subtract+multiply (each component
-// d² ≤ 65534² ≈ 4.3e9, which fits in uint32 but not int32). Accumulating
-// 14 such terms peaks around 6e10, requiring int64 for the running sum.
-//
-// On amd64 a 32-bit IMUL is a single cycle, where int64 MUL is also 1 cycle
-// but typically with worse register pressure; on Apple Silicon arm64 the
-// difference is small either way. The previous all-int64 version unnecessarily
-// extended every load, costing two extra MOVSX per iteration. Manual unroll
-// helps the Go compiler keep the accumulator in a register.
-func int32SqDist(a *[Dim]int16, b []int16) int32 {
-	_ = b[Dim-1] // bounds-check hint: eliminates 14 checks inside the loop
-	d0 := int32(a[0]) - int32(b[0])
-	d1 := int32(a[1]) - int32(b[1])
-	d2 := int32(a[2]) - int32(b[2])
-	d3 := int32(a[3]) - int32(b[3])
-	d4 := int32(a[4]) - int32(b[4])
-	d5 := int32(a[5]) - int32(b[5])
-	d6 := int32(a[6]) - int32(b[6])
-	d7 := int32(a[7]) - int32(b[7])
-	d8 := int32(a[8]) - int32(b[8])
-	d9 := int32(a[9]) - int32(b[9])
-	d10 := int32(a[10]) - int32(b[10])
-	d11 := int32(a[11]) - int32(b[11])
-	d12 := int32(a[12]) - int32(b[12])
-	d13 := int32(a[13]) - int32(b[13])
-	sum := int64(d0)*int64(d0) + int64(d1)*int64(d1) +
-		int64(d2)*int64(d2) + int64(d3)*int64(d3) +
-		int64(d4)*int64(d4) + int64(d5)*int64(d5) +
-		int64(d6)*int64(d6) + int64(d7)*int64(d7) +
-		int64(d8)*int64(d8) + int64(d9)*int64(d9) +
-		int64(d10)*int64(d10) + int64(d11)*int64(d11) +
-		int64(d12)*int64(d12) + int64(d13)*int64(d13)
-	if sum > 0x7fffffff {
-		return 0x7fffffff
-	}
-	return int32(sum)
 }

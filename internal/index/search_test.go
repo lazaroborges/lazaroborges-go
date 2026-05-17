@@ -16,7 +16,7 @@ func TestTop5_InsertSortedAscending(t *testing.T) {
 	if top.N != 5 {
 		t.Fatalf("expected 5 entries, got %d", top.N)
 	}
-	want := []int32{5, 10, 20, 30, 40}
+	want := []int64{5, 10, 20, 30, 40}
 	for i, w := range want {
 		if top.Dist[i] != w {
 			t.Errorf("dist[%d] = %d, want %d", i, top.Dist[i], w)

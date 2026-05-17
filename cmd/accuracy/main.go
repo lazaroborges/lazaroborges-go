@@ -67,7 +67,7 @@ func main() {
 			maxCell = size
 		}
 	}
-	distBuf := make([]int32, maxCell)
+	distBuf := make([]int64, maxCell)
 
 	var tp, tn, fp, fn, errs int
 	t0 := time.Now()

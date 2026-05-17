@@ -2,18 +2,17 @@ package main
 
 import (
 	"flag"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
 	"runtime/debug"
 	"sync"
-	"time"
+	"syscall"
 
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/index"
-	"github.com/lazaroborges/rinha-de-backend-2026/internal/response"
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/vector"
 )
 
@@ -24,15 +23,9 @@ func init() {
 	runtime.GC()
 }
 
-var contentTypeJSON = []string{"application/json"}
-
 var (
 	idx *index.Index
 
-	bufPool = sync.Pool{New: func() any {
-		b := make([]byte, 0, 4096)
-		return &b
-	}}
 	qFloatPool = sync.Pool{New: func() any {
 		return new([vector.Dim]float32)
 	}}
@@ -49,93 +42,12 @@ var (
 	retryNprobe int
 )
 
-// readBody reads the entire body into the pooled buffer, growing as needed.
-// Avoids io.ReadAll's fresh-slice allocation per request.
-func readBody(r io.Reader, dst *[]byte) ([]byte, error) {
-	*dst = (*dst)[:0]
-	for {
-		if cap(*dst)-len(*dst) < 512 {
-			tmp := make([]byte, len(*dst), cap(*dst)*2+512)
-			copy(tmp, *dst)
-			*dst = tmp
-		}
-		n, err := r.Read((*dst)[len(*dst):cap(*dst)])
-		*dst = (*dst)[:len(*dst)+n]
-		if err == io.EOF {
-			return *dst, nil
-		}
-		if err != nil {
-			return *dst, err
-		}
-	}
-}
-
-func handleFraudScore(w http.ResponseWriter, r *http.Request) {
-	t0 := time.Now()
-	bufPtr := bufPool.Get().(*[]byte)
-	defer bufPool.Put(bufPtr)
-
-	body, err := readBody(r.Body, bufPtr)
-	t1 := time.Now()
-	stReadBody.record(t1.Sub(t0).Nanoseconds())
-	if err != nil || len(body) == 0 {
-		writeBody(w, response.Fallback)
-		return
-	}
-
-	qFloat := qFloatPool.Get().(*[vector.Dim]float32)
-	defer qFloatPool.Put(qFloat)
-	if err := vector.NormalizePayload(body, qFloat); err != nil {
-		writeBody(w, response.Fallback)
-		return
-	}
-
-	qInt := qInt16Pool.Get().(*[vector.Dim]int16)
-	defer qInt16Pool.Put(qInt)
-	vector.Quantize(qFloat, qInt)
-	t2 := time.Now()
-	stParse.record(t2.Sub(t1).Nanoseconds())
-
-	top := top5Pool.Get().(*index.Top5)
-	defer top5Pool.Put(top)
-	cellBuf := cellBufPool.Get().(*[]index.CentroidDist)
-	defer cellBufPool.Put(cellBuf)
-	distBuf := distBufPool.Get().(*[]int32)
-	defer distBufPool.Put(distBuf)
-
-	idx.SearchIVF(qInt, qFloat, baseNprobe, *cellBuf, *distBuf, top)
-	t3 := time.Now()
-	stSearchOne.record(t3.Sub(t2).Nanoseconds())
-	if !decisive(top.FraudCount()) {
-		idx.SearchIVF(qInt, qFloat, retryNprobe, *cellBuf, *distBuf, top)
-		stSearchTwo.record(time.Since(t3).Nanoseconds())
-	}
-	t4 := time.Now()
-
-	count := top.FraudCount()
-	writeBody(w, response.Bodies[count])
-	t5 := time.Now()
-	stWrite.record(t5.Sub(t4).Nanoseconds())
-	stTotal.record(t5.Sub(t0).Nanoseconds())
-}
-
 // decisive reports whether the top-5 vote is far enough from the 0.6 decision
 // threshold that re-running is unlikely to flip the verdict. Retry on counts
 // 2 and 3 — these are the boundary cases where extra cells can change the
 // majority. Aligned with cmd/accuracy so behavior matches the gate.
 func decisive(fraudCount int) bool {
 	return fraudCount <= 1 || fraudCount >= 4
-}
-
-func writeBody(w http.ResponseWriter, body []byte) {
-	h := w.Header()
-	h["Content-Type"] = contentTypeJSON
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
-}
-
-func handleReady(w http.ResponseWriter, _ *http.Request) {
-	w.WriteHeader(http.StatusOK)
 }
 
 func main() {
@@ -147,7 +59,6 @@ func main() {
 	debugAddr := flag.String("debug", "", "if non-empty, expose /debug/timings on this TCP addr (local only)")
 	flag.Parse()
 	if *debugAddr != "" {
-		debugEnabled.Store(true)
 		dmux := http.NewServeMux()
 		dmux.HandleFunc("/debug/timings", handleDebugTimings)
 		dmux.HandleFunc("/debug/reset", handleDebugReset)
@@ -158,6 +69,18 @@ func main() {
 			}
 		}()
 	}
+
+	// SIGTERM dump: docker stop sends SIGTERM. We catch it, dump the per-stage
+	// timing summary to stdout (which the contest infrastructure captures in
+	// container logs), then exit cleanly. Gives us Haswell-ground-truth per-
+	// stage latencies after every contest run without needing -debug.
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+		<-ch
+		dumpTimings()
+		os.Exit(0)
+	}()
 
 	baseNprobe = *nprobeFlag
 	retryNprobe = *retryFlag
@@ -185,22 +108,23 @@ func main() {
 	}
 	log.Printf("largest cluster: %d members", maxCell)
 	distBufPool = &sync.Pool{New: func() any {
-		buf := make([]int32, maxCell)
+		buf := make([]int64, maxCell)
 		return &buf
 	}}
 
 	// Pre-warm pools so the first N requests don't pay allocation cost.
 	// Adds maybe 1 MB of resident heap, eliminates fresh-alloc tail spikes.
 	for i := 0; i < 64; i++ {
-		b := make([]byte, 0, 4096)
-		bufPool.Put(&b)
 		qFloatPool.Put(new([vector.Dim]float32))
 		qInt16Pool.Put(new([vector.Dim]int16))
 		top5Pool.Put(new(index.Top5))
 		cb := make([]index.CentroidDist, idx.NClusters)
 		cellBufPool.Put(&cb)
-		db := make([]int32, maxCell)
+		db := make([]int64, maxCell)
 		distBufPool.Put(&db)
+		// Pre-warm the connection-buffer pool too; one per goroutine matches
+		// the keep-alive connection count under load.
+		connBufPool.Put(&connBuf{data: make([]byte, maxConnBufSize)})
 	}
 
 	var ln net.Listener
@@ -221,19 +145,9 @@ func main() {
 		}
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/fraud-score", handleFraudScore)
-	mux.HandleFunc("/ready", handleReady)
-
-	srv := &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 2 * time.Second,
-		IdleTimeout:       30 * time.Second,
-	}
-
 	runtime.GC()
 	log.Printf("serving on %s", *sockPath)
-	if err := srv.Serve(ln); err != nil {
+	if err := serveUDS(ln); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
 }

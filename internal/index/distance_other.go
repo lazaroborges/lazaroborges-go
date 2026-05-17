@@ -35,10 +35,18 @@ func int16SqDist14(q *[Dim]int16, m *int16) int32 {
 	return int32(sum)
 }
 
-func memberScanAvx2(q *[Dim]int16, members *int16, out *int32, n uint64) {
+// memberScanAvx2 non-amd64 fallback. Pure-Go reference that mirrors the
+// dot-product distance form used by the amd64 kernel.
+func memberScanAvx2(q *[16]int16, members *int16, norms *int64, qNorm int64, out *int64, n uint64) {
+	const stride = Dim
 	for i := uint64(0); i < n; i++ {
-		mp := (*int16)(unsafe.Pointer(uintptr(unsafe.Pointer(members)) + uintptr(i)*Dim*2))
-		op := (*int32)(unsafe.Pointer(uintptr(unsafe.Pointer(out)) + uintptr(i)*4))
-		*op = int16SqDist14(q, mp)
+		mp := (*[Dim]int16)(unsafe.Pointer(uintptr(unsafe.Pointer(members)) + uintptr(i)*stride*2))
+		np := (*int64)(unsafe.Pointer(uintptr(unsafe.Pointer(norms)) + uintptr(i)*8))
+		op := (*int64)(unsafe.Pointer(uintptr(unsafe.Pointer(out)) + uintptr(i)*8))
+		var dot int64
+		for d := 0; d < Dim; d++ {
+			dot += int64(q[d]) * int64(mp[d])
+		}
+		*op = qNorm + *np - 2*dot
 	}
 }
