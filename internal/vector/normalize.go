@@ -12,11 +12,8 @@ const Dim = 14
 // Quantize maps a 14-d float vector (with `-1` sentinels allowed at indices 5
 // and 6) into the int16 layout used by the IVF index.
 //
-//	x ∈ [-1, 1] → int16(x * 32767)
-//
-// The sentinel -1 round-trips to -32767, distinguishable from any value
-// produced via clamp(0..1) → [0, 32767].
-func Quantize(in *[Dim]float32, out *[Dim]int16) {
+//      x ∈ [-1, 1] → int16(x * 32767)
+func Quantize(in *[16]float32, out *[16]int16) {
 	for i := 0; i < Dim; i++ {
 		v := in[i] * 32767
 		if v > 32767 {
@@ -26,12 +23,12 @@ func Quantize(in *[Dim]float32, out *[Dim]int16) {
 		}
 		out[i] = int16(v)
 	}
+	// Padded lanes are already zero from the pool.
 }
 
 // NormalizePayload parses a /fraud-score JSON body and writes the 14-dim
-// normalized float vector into `out`. The parser is order-insensitive: fields
-// may appear in any order within their containing object.
-func NormalizePayload(body []byte, out *[Dim]float32) error {
+// normalized float vector into `out`.
+func NormalizePayload(body []byte, out *[16]float32) error {
 	p := parser{data: body}
 	p.skipWS()
 	if !p.expectByte('{') {

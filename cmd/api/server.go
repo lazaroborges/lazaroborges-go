@@ -4,7 +4,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/index"
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/response"
@@ -37,9 +36,9 @@ type connBuf struct {
 	rpos int // next byte to consume in data[rpos:used]
 }
 
-var connBufPool = sync.Pool{New: func() any {
+var connBufPool = newFreeList(func() any {
 	return &connBuf{data: make([]byte, maxConnBufSize)}
-}}
+})
 
 // serveUDS runs a custom accept loop on `ln`. One goroutine per accepted
 // connection, looping for the lifetime of that keep-alive connection.
@@ -54,17 +53,17 @@ func serveUDS(ln net.Listener) error {
 }
 
 func handleConn(c net.Conn) {
-	defer c.Close()
 	b := connBufPool.Get().(*connBuf)
-	defer connBufPool.Put(b)
 	b.used = 0
 	b.rpos = 0
 
 	for {
 		if !processOne(c, b) {
-			return
+			break
 		}
 	}
+	c.Close()
+	connBufPool.Put(b)
 }
 
 // processOne reads one HTTP/1.1 request from `c` into `b`, runs the search
@@ -125,28 +124,32 @@ func processOne(c net.Conn, b *connBuf) bool {
 // the pre-built response frames. Errors short-circuit to FallbackFrame so we
 // never emit a 5xx (per scoring shape, 5xx is weighted 5× in detection error).
 func processSearch(body []byte) []byte {
-	qFloat := qFloatPool.Get().(*[vector.Dim]float32)
-	defer qFloatPool.Put(qFloat)
+	qFloat := qFloatPool.Get().(*[16]float32)
 	if err := vector.NormalizePayload(body, qFloat); err != nil {
+		qFloatPool.Put(qFloat)
 		return response.FallbackFrame
 	}
-	qInt := qInt16Pool.Get().(*[vector.Dim]int16)
-	defer qInt16Pool.Put(qInt)
+	qInt := qInt16Pool.Get().(*[16]int16)
 	vector.Quantize(qFloat, qInt)
 
 	top := top5Pool.Get().(*index.Top5)
-	defer top5Pool.Put(top)
 	cellBuf := cellBufPool.Get().(*[]index.CentroidDist)
-	defer cellBufPool.Put(cellBuf)
 	distBuf := distBufPool.Get().(*[]int64)
-	defer distBufPool.Put(distBuf)
 
 	idx.SearchIVF(qInt, qFloat, baseNprobe, *cellBuf, *distBuf, top)
 	if !decisive(top.FraudCount()) {
 		idx.SearchIVF(qInt, qFloat, retryNprobe, *cellBuf, *distBuf, top)
 	}
 
-	return response.Frames[top.FraudCount()]
+	frame := response.Frames[top.FraudCount()]
+
+	qFloatPool.Put(qFloat)
+	qInt16Pool.Put(qInt)
+	top5Pool.Put(top)
+	cellBufPool.Put(cellBuf)
+	distBufPool.Put(distBuf)
+
+	return frame
 }
 
 func readUntilHeaderEnd(c net.Conn, b *connBuf) (int, error) {

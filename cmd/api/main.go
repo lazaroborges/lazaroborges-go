@@ -9,11 +9,9 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
-	"sync"
 	"syscall"
 
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/index"
-	"github.com/lazaroborges/rinha-de-backend-2026/internal/vector"
 )
 
 func init() {
@@ -26,21 +24,42 @@ func init() {
 var (
 	idx *index.Index
 
-	qFloatPool = sync.Pool{New: func() any {
-		return new([vector.Dim]float32)
-	}}
-	qInt16Pool = sync.Pool{New: func() any {
-		return new([vector.Dim]int16)
-	}}
-	top5Pool = sync.Pool{New: func() any {
-		return new(index.Top5)
-	}}
-	cellBufPool *sync.Pool // initialised after we know NClusters
-	distBufPool *sync.Pool // initialised after we know NVectors
+	// Helicopter optimization: custom single-threaded freeList instead of sync.Pool.
+	// Since GOMAXPROCS=1, we don't need atomic sync or thread-local caches.
+	qFloatPool = newFreeList(func() any { return new([16]float32) })
+	qInt16Pool = newFreeList(func() any { return new([16]int16) })
+	top5Pool   = newFreeList(func() any { return new(index.Top5) })
+
+	cellBufPool *freeList // initialised after we know NClusters
+	distBufPool *freeList // initialised after we know NVectors
 
 	baseNprobe  int
 	retryNprobe int
 )
+
+type freeList struct {
+	items []any
+	newFn func() any
+}
+
+func newFreeList(fn func() any) *freeList {
+	return &freeList{items: make([]any, 0, 128), newFn: fn}
+}
+
+func (f *freeList) Get() any {
+	if len(f.items) == 0 {
+		return f.newFn()
+	}
+	item := f.items[len(f.items)-1]
+	f.items = f.items[:len(f.items)-1]
+	return item
+}
+
+func (f *freeList) Put(item any) {
+	if len(f.items) < cap(f.items) {
+		f.items = append(f.items, item)
+	}
+}
 
 // decisive reports whether the top-5 vote is far enough from the 0.6 decision
 // threshold that re-running is unlikely to flip the verdict. Retry on counts
@@ -92,13 +111,12 @@ func main() {
 	idx = loaded
 	log.Printf("loaded index: %d vectors, %d clusters", idx.NVectors, idx.NClusters)
 
-	cellBufPool = &sync.Pool{New: func() any {
+	cellBufPool = newFreeList(func() any {
 		buf := make([]index.CentroidDist, idx.NClusters)
 		return &buf
-	}}
+	})
 
-	// Member-scan output buffer needs to fit the largest cluster. Compute
-	// once at load and size the pool to that.
+	// Member-scan output buffer needs to fit the largest cluster.
 	maxCell := 0
 	for c := 0; c < idx.NClusters; c++ {
 		size := int(idx.ClusterOffsets[c+1] - idx.ClusterOffsets[c])
@@ -107,23 +125,20 @@ func main() {
 		}
 	}
 	log.Printf("largest cluster: %d members", maxCell)
-	distBufPool = &sync.Pool{New: func() any {
+	distBufPool = newFreeList(func() any {
 		buf := make([]int64, maxCell)
 		return &buf
-	}}
+	})
 
 	// Pre-warm pools so the first N requests don't pay allocation cost.
-	// Adds maybe 1 MB of resident heap, eliminates fresh-alloc tail spikes.
-	for i := 0; i < 64; i++ {
-		qFloatPool.Put(new([vector.Dim]float32))
-		qInt16Pool.Put(new([vector.Dim]int16))
+	for i := 0; i < 128; i++ {
+		qFloatPool.Put(new([16]float32))
+		qInt16Pool.Put(new([16]int16))
 		top5Pool.Put(new(index.Top5))
 		cb := make([]index.CentroidDist, idx.NClusters)
 		cellBufPool.Put(&cb)
 		db := make([]int64, maxCell)
 		distBufPool.Put(&db)
-		// Pre-warm the connection-buffer pool too; one per goroutine matches
-		// the keep-alive connection count under load.
 		connBufPool.Put(&connBuf{data: make([]byte, maxConnBufSize)})
 	}
 

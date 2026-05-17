@@ -54,49 +54,43 @@ func (t *Top5) insert(d int64, lab uint8) {
 	t.Label[pos] = lab
 }
 
-// SearchIVF runs the IVF query. `qVec` is the int16-quantized query and
-// `qVecFloat` is the same value as float32 (used for centroid distance). The
-// caller is responsible for both. `nprobe` controls how many cells to scan.
-// `cellBuf` is a scratch buffer of length ≥ nClusters used for centroid
-// distance ranking. `distBuf` is a scratch buffer of length ≥ maxCellSize
-// used for per-cell member distances. Results are written into `out`.
-func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe int, cellBuf []CentroidDist, distBuf []int64, out *Top5) {
+// SearchIVF runs the IVF query. `qVec` is the int16-quantized query (padded to 16)
+// and `qVecFloat` is the same as float32 (padded to 16).
+func (idx *Index) SearchIVF(qVec *[16]int16, qVecFloat *[16]float32, nprobe int, cellBuf []CentroidDist, distBuf []int64, out *Top5) {
 	out.Reset()
 
-	// Distance from query to every centroid via the norm trick:
-	//   ||q-c||² = ||q||² + ||c||² - 2·(q·c)
-	// We pre-computed ||c||² at load. ||q||² is identical across centroids so
-	// it doesn't affect ranking — we can drop it entirely.
-	var qPad [16]float32
-	copy(qPad[:Dim], qVecFloat[:])
-	centroidPassAvx2(&qPad, &idx.CentroidsPadded[0], &idx.CentroidNorms[0], &cellBuf[0], uint64(idx.NClusters))
-	// Partial sort: find the nprobe smallest using selection.
-	selectTopK(cellBuf[:idx.NClusters], nprobe)
+	// Distance from query to every centroid via the norm trick.
+	centroidPassAvx2(qVecFloat, &idx.CentroidsPadded[0], &idx.CentroidNorms[0], &cellBuf[0], uint64(idx.NClusters))
 
-	// Re-sort the selected nprobe cells by cluster index (ascending) so the
-	// member scan reads MemberVecs in increasing offset order. This is much
-	// friendlier to the L2 prefetcher than the arbitrary order quickselect
-	// leaves behind. Insertion sort is fine — nprobe is small (≤ ~96).
-	for i := 1; i < nprobe; i++ {
-		for j := i; j > 0 && cellBuf[j].Cluster < cellBuf[j-1].Cluster; j-- {
-			cellBuf[j], cellBuf[j-1] = cellBuf[j-1], cellBuf[j]
+	// Specialized linear scan for small nprobe (helicopter optimization).
+	// Partitioning 2048 elements for nprobe=3 is wasteful.
+	if nprobe <= 4 {
+		for i := 0; i < nprobe; i++ {
+			bestIdx := i
+			for j := i + 1; j < idx.NClusters; j++ {
+				if cellBuf[j].Dist < cellBuf[bestIdx].Dist {
+					bestIdx = j
+				}
+			}
+			cellBuf[i], cellBuf[bestIdx] = cellBuf[bestIdx], cellBuf[i]
+		}
+	} else {
+		selectTopK(cellBuf[:idx.NClusters], nprobe)
+		// Re-sort selected cells for prefetcher friendliness.
+		for i := 1; i < nprobe; i++ {
+			for j := i; j > 0 && cellBuf[j].Cluster < cellBuf[j-1].Cluster; j-- {
+				cellBuf[j], cellBuf[j-1] = cellBuf[j-1], cellBuf[j]
+			}
 		}
 	}
 
-	// Precompute ||q||² in int64 — constant for this query, used by every
-	// member-distance computation in the kernel.
+	// Precompute ||q||² once (helicopter optimization: done in int64 directly).
 	var qNorm int64
-	var qPadI16 [16]int16
 	for i := 0; i < Dim; i++ {
 		v := int64(qVec[i])
 		qNorm += v * v
-		qPadI16[i] = qVec[i]
 	}
 
-	// Iterate members of those top nprobe cells. Per cell we batch the
-	// distance kernel as one VPMADDWD-based asm call that keeps q in YMM
-	// registers across all members in the cell and writes int64 distances to
-	// distBuf; then a tight Go loop feeds them into the fixed-size top-5.
 	mem := idx.MemberVecs
 	labels := idx.Labels
 	norms := idx.MemberNorms
@@ -108,7 +102,7 @@ func (idx *Index) SearchIVF(qVec *[Dim]int16, qVecFloat *[Dim]float32, nprobe in
 		if count == 0 {
 			continue
 		}
-		memberScanAvx2(&qPadI16, &mem[int(from)*Dim], &norms[from], qNorm, &distBuf[0], uint64(count))
+		memberScanAvx2(qVec, &mem[int(from)*Dim], &norms[from], qNorm, &distBuf[0], uint64(count))
 		labelBase := labels[from:to]
 		for v := 0; v < count; v++ {
 			out.insert(distBuf[v], labelBase[v])
