@@ -90,5 +90,5 @@ type SearchScratch struct {
 	Visited []uint64      // bitmap sized to max cluster
 	Cand    hnsw.MinHeap
 	HnswOut hnsw.MaxHeap
-	PerCell [4]hnsw.MaxHeap // per-cell K=8 results
+	PerCell [8]hnsw.MaxHeap // per-cell K=8 results (supports nCells up to 8)
 }

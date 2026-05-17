@@ -11,7 +11,7 @@ import (
 // HNSW (K=8 each) → merge to top-10 by int8 distance → float32 re-rank →
 // final top-5 written to `out`.
 //
-// nCells must be ≤ len(scratch.PerCell) (currently 4).
+// nCells must be ≤ len(scratch.PerCell) (currently 8).
 // The caller is responsible for providing scratch.CellBuf sized to NClusters
 // and scratch.Visited sized to the cluster's max member count.
 func (idx *Index) SearchIVFHNSW(
