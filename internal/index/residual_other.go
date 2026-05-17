@@ -6,7 +6,8 @@ package index
 // where qRes is the per-query residual in int16 space (produced as
 // int16(qInt8[i]) - int16(centroidInt8[i]); range ±255) and mRes is the
 // stored member residual (int8). Padded lanes [14:16] in both inputs MUST
-// be zero — callers are responsible.
+// be zero — (the pure-Go version ignores them structurally via a 0..13 loop; the
+// AVX2 sibling masks them internally — either way, callers need not clear).
 //
 // Accumulator is int64 for safety; at the documented input range the sum
 // always fits in int32, so the final narrowing is loss-free.
