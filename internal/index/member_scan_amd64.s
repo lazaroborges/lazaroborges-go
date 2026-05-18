@@ -41,6 +41,21 @@ loop:
 	CMPQ R10, R9
 	JE   done
 
+	// Software prefetch: bring the member 8 iterations ahead into L1 while
+	// we compute the current one. Member stride is 28 bytes, so 8 ahead is
+	// 224 B (~3.5 cache lines) — enough distance to hide ~70 ns of DDR3
+	// latency given each iteration is ~5 ns. Non-faulting; reads past the
+	// cluster end are safe because the mmap is contiguous.
+	//
+	// Why this is needed: under k6 burst load with two API instances on a
+	// 0.45-CPU CFS quota each, the goroutine running this scan can lose its
+	// L2/L3 lines to a sibling goroutine's scan between iterations. The HW
+	// stride prefetcher recovers on uninterrupted runs (post-test) but not
+	// during the chaotic mid-test phase. Manual prefetch closes that gap.
+	PREFETCHT0 224(BX)
+	PREFETCHT0 256(BX)
+	PREFETCHT0 64(CX)             // norms 8 ahead (1 cache line)
+
 	VMOVDQU (BX), Y1              // 32-byte member load (overruns 4B; lanes 14,15 zeroed by q)
 	VPMADDWD Y0, Y1, Y2           // Y2 = 8 int32 partial sums: (q·m)_pair
 
