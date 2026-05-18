@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"bytes"
 	"errors"
 
 	"github.com/lazaroborges/rinha-de-backend-2026/internal/constants"
@@ -235,7 +236,7 @@ func NormalizePayload(body []byte, out *[16]float32) error {
 	}
 	out[11] = 1
 	for i := 0; i < knownN; i++ {
-		if bytesEq(knownArr[i], merchantID) {
+		if bytes.Equal(knownArr[i], merchantID) {
 			out[11] = 0
 			break
 		}
@@ -257,16 +258,4 @@ func clamp01(v float32) float32 {
 		return 1
 	}
 	return v
-}
-
-func bytesEq(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

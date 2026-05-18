@@ -78,54 +78,41 @@ func handleConn(c net.Conn) {
 func processOne(c net.Conn, b *connBuf) bool {
 	headerEnd, err := readUntilHeaderEnd(c, b)
 	if err != nil {
-		// Clean EOF on a keep-alive idle conn is the normal way a connection
-		// ends. Don't write a fallback — the peer is gone.
 		return false
 	}
-	// Start timing once we have a complete request header; this excludes
-	// keep-alive idle time between requests.
 	t0 := time.Now()
 
 	headers := b.data[b.rpos : b.rpos+headerEnd]
 	bodyStart := b.rpos + headerEnd + 4
 
 	// Handle /ready health check.
-	if len(headers) >= 10 && matchLowerASCII(headers[:10], []byte("get /ready")) {
+	if len(headers) >= 10 && (headers[0]|0x20 == 'g') && (headers[5]|0x20 == 'r') {
 		if _, err := c.Write(response.ReadyFrame); err != nil {
 			return false
 		}
-		// /ready usually isn't pipelined, but if it is, consume the header.
-		// Health checks don't have bodies.
 		b.rpos = bodyStart
 		return true
 	}
 
 	cl := findContentLength(headers)
-
 	if cl < 0 || cl > maxBodySize {
 		_, _ = c.Write(response.FallbackFrame)
 		return false
 	}
 
-	tBeforeBody := time.Now()
 	if err := ensureBody(c, b, bodyStart, cl); err != nil {
 		return false
 	}
-	stReadBody.record(int64(time.Since(tBeforeBody)))
 	body := b.data[bodyStart : bodyStart+cl]
 
 	frame := processSearch(body)
 
-	tWrite := time.Now()
 	if _, err := c.Write(frame); err != nil {
 		return false
 	}
-	stWrite.record(int64(time.Since(tWrite)))
 
 	stTotal.record(int64(time.Since(t0)))
 
-	// Consume this request from the buffer; any extra bytes belong to the
-	// next pipelined request and stay around for the next iteration.
 	consumed := bodyStart + cl
 	if consumed == b.used {
 		b.rpos = 0
@@ -145,11 +132,7 @@ func processSearch(body []byte) []byte {
 	return processSearchV1(body)
 }
 
-// processSearchV1 runs the existing IVF pipeline on `body` and returns one of
-// the pre-built response frames. Errors short-circuit to FallbackFrame so we
-// never emit a 5xx (per scoring shape, 5xx is weighted 5× in detection error).
 func processSearchV1(body []byte) []byte {
-	tParse := time.Now()
 	qFloat := qFloatPool.Get().(*[16]float32)
 	if err := vector.NormalizePayload(body, qFloat); err != nil {
 		qFloatPool.Put(qFloat)
@@ -157,19 +140,14 @@ func processSearchV1(body []byte) []byte {
 	}
 	qInt := qInt16Pool.Get().(*[16]int16)
 	vector.Quantize(qFloat, qInt)
-	stParse.record(int64(time.Since(tParse)))
 
 	top := top5Pool.Get().(*index.Top5)
 	cellBuf := cellBufPool.Get().(*[]index.CentroidDist)
 	distBuf := distBufPool.Get().(*[]int64)
 
-	tBase := time.Now()
 	idx.SearchIVF(qInt, qFloat, baseNprobe, *cellBuf, *distBuf, top)
-	stSearchOne.record(int64(time.Since(tBase)))
 	if !decisive(top.FraudCount()) {
-		tRetry := time.Now()
 		idx.SearchIVF(qInt, qFloat, retryNprobe, *cellBuf, *distBuf, top)
-		stSearchTwo.record(int64(time.Since(tRetry)))
 	}
 
 	frame := response.Frames[top.FraudCount()]

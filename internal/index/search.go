@@ -28,8 +28,7 @@ func (t *Top5) FraudCount() int {
 	return n
 }
 
-// insert adds (d, lab) into the sorted top-5 if it qualifies. Branch-light
-// insertion sort over a fixed 5-element array.
+// insert adds (d, lab) into the sorted top-5 if it qualifies.
 func (t *Top5) insert(d int64, lab uint8) {
 	if t.N < 5 {
 		t.Dist[t.N] = d
@@ -41,9 +40,7 @@ func (t *Top5) insert(d int64, lab uint8) {
 		}
 		return
 	}
-	if d >= t.Dist[4] {
-		return
-	}
+	// Caller already checks d < t.Dist[4]
 	pos := 4
 	for pos > 0 && t.Dist[pos-1] > d {
 		t.Dist[pos] = t.Dist[pos-1]
@@ -94,6 +91,8 @@ func (idx *Index) SearchIVF(qVec *[16]int16, qVecFloat *[16]float32, nprobe int,
 	mem := idx.MemberVecs
 	labels := idx.Labels
 	norms := idx.MemberNorms
+	maxDist := int64(9223372036854775807) // math.MaxInt64
+
 	for k := 0; k < nprobe; k++ {
 		c := cellBuf[k].Cluster
 		from := idx.ClusterOffsets[c]
@@ -105,7 +104,13 @@ func (idx *Index) SearchIVF(qVec *[16]int16, qVecFloat *[16]float32, nprobe int,
 		memberScanAvx2(qVec, &mem[int(from)*Dim], &norms[from], qNorm, &distBuf[0], uint64(count))
 		labelBase := labels[from:to]
 		for v := 0; v < count; v++ {
-			out.insert(distBuf[v], labelBase[v])
+			d := distBuf[v]
+			if d < maxDist {
+				out.insert(d, labelBase[v])
+				if out.N == 5 {
+					maxDist = out.Dist[4]
+				}
+			}
 		}
 	}
 }

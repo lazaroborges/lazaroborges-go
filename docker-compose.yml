@@ -23,24 +23,17 @@ services:
     command:
       - "-socket=/var/run/sockets/api-1.sock"
       - "-index=/index.bin"
-      - "-nprobe=4"
-      - "-retry-nprobe=24"
-      - "-debug=:6060"
+      - "-nprobe=16"
+      - "-retry-nprobe=128"
     environment:
-      # asyncpreemptoff was a Mac-native win (no CFS quota) but a disaster
-      # on the 0.45-CPU contest box: a goroutine stuck in the IVF loop
-      # monopolised the M, so HTTP accept starved for tens of ms whenever
-      # CFS throttled. Default async preempt + GOMAXPROCS=1 keeps the
-      # network poller responsive.
       GOGC: "off"
-    ports:
-      - "16060:6060"
+    ports: []
     volumes:
       - sockets:/var/run/sockets
     deploy:
       resources:
         limits:
-          cpus: "0.35"
+          cpus: "0.45"
           memory: "160MB"
     networks: [rinha]
 
@@ -49,11 +42,10 @@ services:
     command:
       - "-socket=/var/run/sockets/api-2.sock"
       - "-index=/index.bin"
-      - "-nprobe=4"
-      - "-retry-nprobe=24"
+      - "-nprobe=16"
+      - "-retry-nprobe=128"
     environment:
       GOGC: "off"
-    # api-2 does not expose debug port (only api-1 is instrumented).
     ports: []
 
   haproxy:
@@ -71,7 +63,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.30"
+          cpus: "0.10"
           memory: "25MB"
     networks: [rinha]
 
