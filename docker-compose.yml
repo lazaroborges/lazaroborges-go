@@ -1,6 +1,7 @@
 services:
   nginx:
     image: nginx:1.27-alpine
+    platform: linux/amd64
     ports:
       - "9999:9999"
     volumes:
@@ -18,6 +19,7 @@ services:
 
   api1:
     image: lazaroborges/lazaroborges-go:latest
+    platform: linux/amd64
     environment:
       ADDR: ":8080"
       NPROBE: "32"
@@ -34,6 +36,7 @@ services:
 
   api2:
     image: lazaroborges/lazaroborges-go:latest
+    platform: linux/amd64
     environment:
       ADDR: ":8080"
       NPROBE: "32"

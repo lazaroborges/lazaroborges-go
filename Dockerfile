@@ -4,7 +4,7 @@ WORKDIR /src
 COPY go.mod .
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOARCH=amd64 GOOS=linux \
+RUN CGO_ENABLED=0 GOARCH=amd64 GOOS=linux GOAMD64=v3 \
     go build -ldflags="-s -w" -o /app/server ./
 RUN CGO_ENABLED=0 GOARCH=amd64 GOOS=linux \
     go build -ldflags="-s -w" -o /app/build-index ./cmd/build-index/
