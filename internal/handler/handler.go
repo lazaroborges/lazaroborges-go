@@ -17,11 +17,11 @@ type Searcher interface {
 }
 
 // precomputed responses indexed by fraudCount (0-5).
-// fraud_score = fraudCount/5; approved = fraud_score < 0.6 → fraudCount < 3.
+// Bayes-optimal threshold given C(FN)=3*C(FP): reject when fraudCount >= 2.
 var responses = [6][]byte{
 	[]byte("{\"approved\":true,\"fraud_score\":0}\n"),
 	[]byte("{\"approved\":true,\"fraud_score\":0.2}\n"),
-	[]byte("{\"approved\":true,\"fraud_score\":0.4}\n"),
+	[]byte("{\"approved\":false,\"fraud_score\":0.4}\n"),
 	[]byte("{\"approved\":false,\"fraud_score\":0.6}\n"),
 	[]byte("{\"approved\":false,\"fraud_score\":0.8}\n"),
 	[]byte("{\"approved\":false,\"fraud_score\":1}\n"),
