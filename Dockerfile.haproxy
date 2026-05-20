@@ -1,3 +1,0 @@
-FROM haproxy:2.9-alpine
-
-COPY rinha-2026/deploy/haproxy.cfg /usr/local/etc/haproxy/haproxy.cfg
