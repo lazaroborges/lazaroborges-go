@@ -14,8 +14,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.10"
-          memory: "30MB"
+          cpus: "0.15"
+          memory: "50MB"
 
   api1:
     image: lazaroborges/lazaroborges-go:latest
@@ -31,8 +31,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "160MB"
+          cpus: "0.425"
+          memory: "150MB"
 
   api2:
     image: lazaroborges/lazaroborges-go:latest
@@ -48,5 +48,5 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.45"
-          memory: "160MB"
+          cpus: "0.425"
+          memory: "150MB"

@@ -11,7 +11,8 @@ const (
 	NumBuckets     = 16
 
 	NCentroids = 512
-	NProbe     = 32
+	NProbe     = 64
+	MaxNProbe  = 128
 )
 
 // BucketDesc describes one partition in the binary index.

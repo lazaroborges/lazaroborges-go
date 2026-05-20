@@ -20,6 +20,7 @@ type bucketView struct {
 	nDims      int
 	nCentroids int
 	nVectors   int
+	dims       []int     // comparison dim indices (cached from DimsForBucket)
 	centroids  []float32 // nCentroids * nDims
 	cellSizes  []uint32  // nCentroids
 	cellStart  []int     // prefix sum of cellSizes, len = nCentroids+1
@@ -84,6 +85,7 @@ func Open(path string, nprobe int) (*Index, error) {
 			nDims:      nDims,
 			nCentroids: nCentroids,
 			nVectors:   nVectors,
+			dims:       DimsForBucket(bi),
 			centroids:  centSlice,
 			cellSizes:  szSlice,
 			cellStart:  cellStart,
@@ -110,25 +112,27 @@ func (idx *Index) SearchK5(query [14]float32) (fraudCount int, fraudScore float3
 		return 0, 0
 	}
 
-	dims := DimsForBucket(bid)
+	dims := bv.dims
 	nDims := bv.nDims
 	nprobe := idx.nprobe
 	if nprobe > bv.nCentroids {
 		nprobe = bv.nCentroids
 	}
 
-	// Extract query's comparison dims as float32
-	qf := make([]float32, nDims)
+	// Extract query's comparison dims as float32 (stack-allocated)
+	var qfArr [11]float32
+	qf := qfArr[:nDims]
 	for i, d := range dims {
 		qf[i] = query[d]
 	}
 
-	// Find nprobe nearest centroids using float32 Euclidean distance
+	// Find nprobe nearest centroids using float32 Euclidean distance (stack-allocated)
 	type centDist struct {
 		idx  int
 		dist float32
 	}
-	topCent := make([]centDist, nprobe)
+	var topCentArr [MaxNProbe]centDist
+	topCent := topCentArr[:nprobe]
 	for i := range topCent {
 		topCent[i].dist = math.MaxFloat32
 	}
@@ -155,8 +159,9 @@ func (idx *Index) SearchK5(query [14]float32) (fraudCount int, fraudScore float3
 		}
 	}
 
-	// Quantize query dims to int8 for cell scanning
-	qi := make([]int8, nDims)
+	// Quantize query dims to int8 for cell scanning (stack-allocated)
+	var qiArr [11]int8
+	qi := qiArr[:nDims]
 	for i, v := range qf {
 		qi[i] = QuantizeF32(v)
 	}

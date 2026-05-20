@@ -1,9 +1,6 @@
 package vectorize
 
-import (
-	"strings"
-	"time"
-)
+import "strings"
 
 type Normalization struct {
 	MaxAmount            float32 `json:"max_amount"`
@@ -63,6 +60,43 @@ func clamp(v float32) float32 {
 	return v
 }
 
+// fastHour parses the hour from an RFC3339 string "YYYY-MM-DDTHH:MM:SSZ".
+func fastHour(s string) int {
+	return int(s[11]-'0')*10 + int(s[12]-'0')
+}
+
+// fastWeekday returns weekday Monday=0 … Sunday=6 using Tomohiko Sakamoto's algorithm.
+func fastWeekday(s string) int {
+	y := int(s[0]-'0')*1000 + int(s[1]-'0')*100 + int(s[2]-'0')*10 + int(s[3]-'0')
+	mo := int(s[5]-'0')*10 + int(s[6]-'0')
+	d := int(s[8]-'0')*10 + int(s[9]-'0')
+	t := [12]int{0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4}
+	if mo < 3 {
+		y--
+	}
+	// time.Weekday: Sunday=0; we want Monday=0…Sunday=6
+	dow := (y + y/4 - y/100 + y/400 + t[mo-1] + d) % 7
+	return (dow + 6) % 7
+}
+
+// fastSeconds converts "YYYY-MM-DDTHH:MM:SS[Z|+00:00]" to a Unix-like second count
+// suitable only for computing differences (no timezone handling beyond UTC).
+func fastSeconds(s string) int64 {
+	y := int64(s[0]-'0')*1000 + int64(s[1]-'0')*100 + int64(s[2]-'0')*10 + int64(s[3]-'0')
+	mo := int64(s[5]-'0')*10 + int64(s[6]-'0')
+	d := int64(s[8]-'0')*10 + int64(s[9]-'0')
+	h := int64(s[11]-'0')*10 + int64(s[12]-'0')
+	mi := int64(s[14]-'0')*10 + int64(s[15]-'0')
+	sc := int64(s[17]-'0')*10 + int64(s[18]-'0')
+	// Julian day number formula
+	if mo <= 2 {
+		y--
+		mo += 12
+	}
+	days := 365*y + y/4 - y/100 + y/400 + (306*(mo+1))/10 + d
+	return days*86400 + h*3600 + mi*60 + sc
+}
+
 // Vectorize transforms a Payload into a 14-dimensional vector.
 // mccRisk lookup falls back to 0.5 for unknown MCCs.
 func Vectorize(p Payload, n Normalization, mccRisk map[string]float32) [14]float32 {
@@ -78,26 +112,18 @@ func Vectorize(p Payload, n Normalization, mccRisk map[string]float32) [14]float
 	v[2] = clamp((p.Transaction.Amount / p.Customer.AvgAmount) / n.AmountVsAvgRatio)
 
 	// dims 3, 4: hour and weekday from requested_at (UTC)
-	t, _ := time.Parse(time.RFC3339, p.Transaction.RequestedAt)
-	v[3] = float32(t.UTC().Hour()) / 23.0
-	// time.Weekday: Sunday=0, Monday=1 … Saturday=6
-	// Challenge: Monday=0 … Sunday=6
-	wd := int(t.UTC().Weekday())
-	if wd == 0 {
-		wd = 6
-	} else {
-		wd--
-	}
-	v[4] = float32(wd) / 6.0
+	reqAt := p.Transaction.RequestedAt
+	v[3] = float32(fastHour(reqAt)) / 23.0
+	v[4] = float32(fastWeekday(reqAt)) / 6.0
 
 	// dims 5, 6: last_transaction
 	if p.LastTransaction == nil {
 		v[5] = -1
 		v[6] = -1
 	} else {
-		tLast, _ := time.Parse(time.RFC3339, p.LastTransaction.Timestamp)
-		tNow, _ := time.Parse(time.RFC3339, p.Transaction.RequestedAt)
-		minutes := float32(tNow.Sub(tLast).Minutes())
+		nowSec := fastSeconds(reqAt)
+		lastSec := fastSeconds(p.LastTransaction.Timestamp)
+		minutes := float32(nowSec-lastSec) / 60.0
 		v[5] = clamp(minutes / n.MaxMinutes)
 		v[6] = clamp(p.LastTransaction.KmFromCurrent / n.MaxKm)
 	}

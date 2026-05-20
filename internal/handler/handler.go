@@ -1,9 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"runtime/debug"
+	"sync"
 
 	"lazaroborges-go/internal/vectorize"
 )
@@ -12,6 +15,19 @@ import (
 type Searcher interface {
 	SearchK5(q [14]float32) (int, float32)
 }
+
+// precomputed responses indexed by fraudCount (0-5).
+// fraud_score = fraudCount/5; approved = fraud_score < 0.6 → fraudCount < 3.
+var responses = [6][]byte{
+	[]byte("{\"approved\":true,\"fraud_score\":0}\n"),
+	[]byte("{\"approved\":true,\"fraud_score\":0.2}\n"),
+	[]byte("{\"approved\":true,\"fraud_score\":0.4}\n"),
+	[]byte("{\"approved\":false,\"fraud_score\":0.6}\n"),
+	[]byte("{\"approved\":false,\"fraud_score\":0.8}\n"),
+	[]byte("{\"approved\":false,\"fraud_score\":1}\n"),
+}
+
+var bufPool = sync.Pool{New: func() any { return bytes.NewBuffer(make([]byte, 0, 1024)) }}
 
 type Handler struct {
 	idx  Searcher
@@ -39,28 +55,35 @@ func (h *Handler) fraudScore(w http.ResponseWriter, r *http.Request) {
 			debug.PrintStack()
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"approved":true,"fraud_score":0.0}` + "\n"))
+			_, _ = w.Write(responses[0])
 		}
 	}()
 
-	var payload vectorize.Payload
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	_, err := io.Copy(buf, r.Body)
+	if err != nil {
+		bufPool.Put(buf)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"approved":true,"fraud_score":0.0}` + "\n"))
+		_, _ = w.Write(responses[0])
 		return
 	}
 
-	vec := vectorize.Vectorize(payload, h.norm, h.mcc)
-	_, fraudScore := h.idx.SearchK5(vec)
-	approved := fraudScore < 0.6
-
-	type response struct {
-		Approved   bool    `json:"approved"`
-		FraudScore float32 `json:"fraud_score"`
+	var payload vectorize.Payload
+	if err := json.Unmarshal(buf.Bytes(), &payload); err != nil {
+		bufPool.Put(buf)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(responses[0])
+		return
 	}
+	bufPool.Put(buf)
+
+	vec := vectorize.Vectorize(payload, h.norm, h.mcc)
+	fraudCount, _ := h.idx.SearchK5(vec)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(response{Approved: approved, FraudScore: fraudScore})
+	_, _ = w.Write(responses[fraudCount])
 }
