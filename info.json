@@ -1,0 +1,7 @@
+{
+    "participants": ["Lazaro Borges"],
+    "social": ["https://github.com/lazaroborges"],
+    "source-code-repo": "https://github.com/lazaroborges/lazaroborges-go",
+    "stack": ["go", "nginx"],
+    "open_to_work": true
+}
