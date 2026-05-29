@@ -18,15 +18,10 @@ services:
           memory: "50MB"
 
   api1:
-    build:
-      context: .
-      platforms:
-        - linux/amd64
     image: lazaroborges/lazaroborges-go:latest
     platform: linux/amd64
     environment:
       ADDR: ":8080"
-      NPROBE: "64"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
       interval: 2s
@@ -39,15 +34,10 @@ services:
           memory: "150MB"
 
   api2:
-    build:
-      context: .
-      platforms:
-        - linux/amd64
     image: lazaroborges/lazaroborges-go:latest
     platform: linux/amd64
     environment:
       ADDR: ":8080"
-      NPROBE: "64"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
       interval: 2s
